@@ -10,83 +10,90 @@
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
 <style>
 :root{
-  --bg:#070b14; --panel:rgba(255,255,255,.04); --line:rgba(255,255,255,.09);
-  --text:#e6ebf5; --muted:#8e9ab3; --a:#34d399; --b:#22d3ee; --warn:#fbbf24; --bad:#f87171;
+  --bg:#141414; --panel:#1b1b1b; --line:#2c2c2c; --text:#d3d3d3; --muted:#7a7a7a;
+  --lime:#c3f02b; --lime2:#9cc41f; --warn:#e8c14d; --bad:#e36b5b; --ok:#8fd14f;
 }
 *{box-sizing:border-box}
 html{scroll-behavior:smooth}
-body{margin:0;background:var(--bg);color:var(--text);font:16px/1.65 Inter,system-ui,sans-serif;
-  background-image:radial-gradient(900px 500px at 10% -10%,rgba(52,211,153,.14),transparent 60%),
-  radial-gradient(800px 500px at 100% 0,rgba(34,211,238,.12),transparent 60%);background-attachment:fixed}
-a{color:var(--b);text-decoration:none} a:hover{text-decoration:underline}
-header.nav{position:sticky;top:0;z-index:10;backdrop-filter:blur(14px);background:rgba(7,11,20,.7);border-bottom:1px solid var(--line)}
-.nav .in{max-width:1000px;margin:auto;padding:14px 24px;display:flex;gap:22px;align-items:center;flex-wrap:wrap}
-.brand{font-weight:800;letter-spacing:-.02em;margin-right:auto}
-.brand span{background:linear-gradient(90deg,var(--a),var(--b));-webkit-background-clip:text;color:transparent}
-.nav a.l{color:var(--muted);font-size:14px;font-weight:500}
-main{max-width:1000px;margin:auto;padding:0 24px 80px}
-.hero{padding:72px 0 40px;text-align:center}
-.pill{display:inline-block;padding:6px 14px;border:1px solid var(--line);border-radius:999px;background:var(--panel);color:var(--muted);font-size:13px}
-h1{font-size:clamp(34px,6vw,58px);line-height:1.08;margin:20px 0 14px;letter-spacing:-.035em;font-weight:800}
-h1 em{font-style:normal;background:linear-gradient(90deg,var(--a),var(--b));-webkit-background-clip:text;color:transparent}
-.hero p{color:var(--muted);max-width:640px;margin:0 auto 30px;font-size:18px}
-.btn{display:inline-flex;align-items:center;gap:10px;padding:14px 26px;border-radius:14px;font-weight:700;color:#04110c;
-  background:linear-gradient(90deg,var(--a),var(--b));box-shadow:0 10px 40px -10px rgba(52,211,153,.6);transition:.2s}
-.btn:hover{transform:translateY(-2px);text-decoration:none;box-shadow:0 14px 50px -8px rgba(34,211,238,.7)}
-.btn.ghost{background:var(--panel);color:var(--text);border:1px solid var(--line);box-shadow:none;margin-left:10px}
-.meta{display:flex;gap:14px;justify-content:center;flex-wrap:wrap;margin-top:26px}
-.meta div{padding:10px 16px;border:1px solid var(--line);border-radius:12px;background:var(--panel);font-size:13px;color:var(--muted)}
-.meta b{display:block;color:var(--text);font-family:'JetBrains Mono',monospace;font-weight:500;font-size:12.5px;word-break:break-all}
-section{margin-top:56px}
-h2{font-size:28px;letter-spacing:-.02em;margin:0 0 6px}
-h2 small{display:block;color:var(--muted);font-size:15px;font-weight:400;margin-top:4px}
-.card{background:var(--panel);border:1px solid var(--line);border-radius:18px;padding:26px;margin-top:18px}
-.steps{counter-reset:s;list-style:none;margin:0;padding:0}
-.steps>li{counter-increment:s;position:relative;padding:4px 0 18px 54px}
-.steps>li::before{content:counter(s);position:absolute;left:0;top:0;width:36px;height:36px;border-radius:11px;display:grid;place-items:center;
-  font-weight:800;color:#04110c;background:linear-gradient(135deg,var(--a),var(--b))}
-.steps>li:not(:last-child)::after{content:"";position:absolute;left:17px;top:42px;bottom:2px;width:2px;background:var(--line)}
-pre{margin:10px 0 0;padding:16px 18px;background:#0a1020;border:1px solid var(--line);border-radius:12px;overflow:auto;
-  font:13.5px/1.6 'JetBrains Mono',monospace;color:#cfe3ff}
-code{font-family:'JetBrains Mono',monospace;font-size:.88em;background:rgba(255,255,255,.07);padding:2px 7px;border-radius:6px}
-pre code{background:none;padding:0}
-.note{display:flex;gap:12px;padding:14px 18px;border-radius:14px;margin-top:16px;font-size:15px;border:1px solid}
-.note.warn{background:rgba(251,191,36,.07);border-color:rgba(251,191,36,.35)}
-.note.bad{background:rgba(248,113,113,.07);border-color:rgba(248,113,113,.4)}
-.note.ok{background:rgba(52,211,153,.07);border-color:rgba(52,211,153,.35)}
-.tabs{display:flex;gap:8px;flex-wrap:wrap;margin-top:18px}
-.tab{padding:9px 16px;border-radius:10px;border:1px solid var(--line);background:var(--panel);color:var(--muted);cursor:pointer;font:600 14px Inter}
-.tab.on{color:#04110c;background:linear-gradient(90deg,var(--a),var(--b));border-color:transparent}
-.pane{display:none}.pane.on{display:block;animation:f .35s ease}
-@keyframes f{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
-table{width:100%;border-collapse:collapse;margin-top:14px;font-size:14.5px}
-td,th{text-align:left;padding:11px 12px;border-bottom:1px solid var(--line);vertical-align:top}
-th{color:var(--muted);font-weight:600;font-size:13px}
-footer{margin-top:70px;padding-top:26px;border-top:1px solid var(--line);color:var(--muted);font-size:13px;text-align:center}
+body{margin:0;color:var(--text);font:15px/1.75 'JetBrains Mono','Inconsolata',ui-monospace,Menlo,Consolas,monospace;
+  background-color:var(--bg);
+  background-image:repeating-linear-gradient(45deg,rgba(255,255,255,.018) 0 2px,transparent 2px 4px),
+                   radial-gradient(1200px 400px at 50% -100px,rgba(195,240,43,.07),transparent 70%)}
+a{color:var(--lime);text-decoration:none} a:hover{text-decoration:underline}
+.wrap{max-width:760px;margin:0 auto;padding:0 22px}
+header.top{padding:44px 0 26px;border-bottom:2px dotted var(--lime2)}
+header.top .wrap{text-align:left}
+.logo{font-size:30px;font-weight:700;color:var(--lime);margin:0;letter-spacing:-.01em}
+.logo i{font-style:normal;color:var(--lime2)}
+.tag{margin:6px 0 20px;color:var(--muted);font-size:17px;font-weight:600}
+.btns{display:flex;gap:10px;flex-wrap:wrap}
+.btn{display:inline-flex;align-items:center;gap:8px;padding:9px 18px;border-radius:999px;font:600 12.5px 'JetBrains Mono',monospace;
+  color:#fff;background:linear-gradient(#3a3a3a,#232323);border:1px solid #444;box-shadow:0 2px 0 #000,inset 0 1px 0 rgba(255,255,255,.12);transition:.15s}
+.btn:hover{text-decoration:none;color:var(--lime);transform:translateY(-1px)}
+.btn.main{background:linear-gradient(#d6ff4a,#a6d014);color:#16200a;border-color:#b6e32b}
+.btn.main:hover{color:#000}
+nav.toc{margin-top:22px;display:flex;gap:18px;flex-wrap:wrap;font-size:13px}
+nav.toc a{color:var(--muted)} nav.toc a:hover{color:var(--lime);text-decoration:none}
+main{padding:34px 0 70px}
+h2{font-size:22px;color:var(--lime);margin:44px 0 6px;font-weight:700}
+h2::before{content:"## ";color:var(--lime2);opacity:.6}
+h2 small{display:block;color:var(--muted);font-size:13.5px;font-weight:400;margin-top:2px}
+h2 small::before{content:""}
+p{margin:12px 0}
+.lead{color:var(--lime);font-size:16px}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:20px 22px;margin-top:16px}
+ul.arrows,.steps{list-style:none;margin:12px 0;padding:0}
+ul.arrows li{position:relative;padding-left:30px}
+ul.arrows li::before,.steps>li::before{content:">>";position:absolute;left:0;color:var(--lime);font-weight:700}
+.steps{counter-reset:s}
+.steps>li{counter-increment:s;position:relative;padding:2px 0 16px 46px}
+.steps>li::before{content:counter(s,decimal-leading-zero);top:2px}
+pre{margin:10px 0 0;padding:14px 16px;background:#0e0e0e;border:1px solid var(--line);border-left:3px solid var(--lime2);border-radius:6px;overflow:auto;
+  font:13px/1.6 'JetBrains Mono',monospace;color:#e5e5e5}
+code{font-family:inherit;font-size:.92em;color:var(--lime);background:#0e0e0e;padding:1px 6px;border-radius:4px;border:1px solid #262626}
+pre code{background:none;border:0;padding:0;color:inherit}
+.note{padding:12px 16px;border-radius:8px;margin-top:14px;font-size:13.5px;border-left:3px solid;background:#181818}
+.note.warn{border-color:var(--warn)} .note.bad{border-color:var(--bad)} .note.ok{border-color:var(--ok)}
+.tabs{display:flex;gap:8px;flex-wrap:wrap;margin-top:16px}
+.tab{padding:8px 16px;border-radius:999px;border:1px solid #444;background:linear-gradient(#333,#202020);color:#cfcfcf;cursor:pointer;font:600 12.5px 'JetBrains Mono',monospace}
+.tab:hover{color:var(--lime)}
+.tab.on{background:linear-gradient(#d6ff4a,#a6d014);color:#16200a;border-color:#b6e32b}
+.pane{display:none}.pane.on{display:block;animation:f .3s ease}
+@keyframes f{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:none}}
+table{width:100%;border-collapse:collapse;margin-top:8px;font-size:13.5px}
+td,th{text-align:left;padding:10px 10px;border-bottom:1px dotted #3a3a3a;vertical-align:top}
+th{color:var(--lime2);font-weight:600}
+.meta{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:10px;margin-top:20px}
+.meta div{padding:10px 14px;border:1px dashed #3a3a3a;border-radius:8px;color:var(--muted);font-size:12px}
+.meta b{display:block;color:var(--text);font-weight:500;word-break:break-all;margin-top:2px}
+footer{margin-top:50px;padding-top:20px;border-top:2px dotted var(--lime2);color:var(--muted);font-size:12.5px}
 </style>
 </head>
 <body>
-<header class="nav"><div class="in">
-  <div class="brand">Archer BE220 · <span>Floresta</span></div>
-  <a class="l" href="#requisitos">Requisitos</a><a class="l" href="#flash">Gravação</a>
-  <a class="l" href="#pos">Pós-flash</a><a class="l" href="#problemas">Problemas</a>
-  <a class="l" href="https://github.com/luizcf14/BE220-GPLMods">GitHub</a>
+<header class="top"><div class="wrap">
+  <h1 class="logo"><i>./</i> Archer-BE220</h1>
+  <p class="tag">Firmware customizado Floresta para TP-Link Archer BE220</p>
+  <div class="btns">
+    <a class="btn main" id="download" href="https://github.com/luizcf14/BE220-GPLMods/raw/main/releases/recovery_bundle.bin">Download recovery_bundle.bin</a>
+    <a class="btn" href="https://github.com/luizcf14/BE220-GPLMods/archive/refs/heads/main.zip">Download as .zip</a>
+    <a class="btn" href="https://github.com/luizcf14/BE220-GPLMods">View on GitHub</a>
+  </div>
+  <nav class="toc"><a href="#requisitos">requisitos</a><a href="#flash">gravação</a><a href="#pos">pós-flash</a><a href="#problemas">problemas</a></nav>
 </div></header>
 
-<main>
-<div class="hero">
-  <span class="pill">TP-Link Archer BE220 · BCM6764 · Wi-Fi 7</span>
-  <h1>Grave o firmware <em>customizado</em><br>em poucos minutos</h1>
-  <p>Sem abrir o roteador: use o Rescue Mode (botão WPS) e o pacote <code>recovery_bundle.bin</code> sempre atualizado neste repositório.</p>
-  <a class="btn" id="download" href="https://github.com/luizcf14/BE220-GPLMods/raw/main/releases/recovery_bundle.bin">⬇ Baixar recovery_bundle.bin</a>
-  <a class="btn ghost" href="https://github.com/luizcf14/BE220-GPLMods">Ver repositório</a>
-  <div class="meta">
-    <div>Última build<b>2026-10-28 11:49</b></div>
-    <div>Tamanho<b>34.9 MB</b></div>
-    <div>SHA-256<b>7521214d24ca32a5eef710edc658f5eac8919ee656b3ac26d2e667f0811f84a0</b></div>
-  </div>
+<main class="wrap">
+<p class="lead">Grave o firmware sem abrir o roteador.</p>
+<p>Use o Rescue Mode (botão WPS) e o pacote <code>recovery_bundle.bin</code>, sempre atualizado neste repositório.</p>
+<ul class="arrows">
+  <li>BCM6764 · Wi-Fi 7 (802.11be)</li>
+  <li>Rescue Mode, SSH ou U-Boot/TFTP</li>
+  <li>Pacote genérico: sem chave SSH, senha <code>changeme</code></li>
+</ul>
+<div class="meta">
+  <div>última build<b>2026-10-28 11:58</b></div>
+  <div>tamanho<b>34.9 MB</b></div>
+  <div>sha-256<b>b5134ad8f336d393e85510847fc126503c4d4063bc7fb5ecdd2711e454ce7e0d</b></div>
 </div>
-
 <section id="requisitos">
   <h2>Antes de começar</h2>
   <div class="card">
