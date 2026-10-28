@@ -34,6 +34,15 @@ header.top .wrap{text-align:left}
 .btn.main:hover{color:#000}
 nav.toc{margin-top:22px;display:flex;gap:18px;flex-wrap:wrap;font-size:13px}
 nav.toc a{color:var(--muted)} nav.toc a:hover{color:var(--lime);text-decoration:none}
+nav.docs-nav{margin-top:16px;padding-top:14px;border-top:1px dashed #333;display:flex;gap:12px;flex-wrap:wrap;font-size:12.5px}
+nav.docs-nav a{color:var(--muted);padding:4px 10px;border-radius:6px;border:1px solid transparent}
+nav.docs-nav a:hover{color:var(--lime);border-color:#333;text-decoration:none}
+nav.docs-nav a.active{color:var(--lime);background:#1f2612;border-color:var(--lime2)}
+.guides-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:12px;margin-top:16px}
+.guide-card{display:block;background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:16px 18px;transition:.15s}
+.guide-card:hover{border-color:var(--lime2);text-decoration:none;transform:translateY(-2px)}
+.guide-card b{display:block;color:var(--lime);font-size:14.5px;margin-bottom:4px}
+.guide-card span{display:block;color:var(--muted);font-size:12.5px;line-height:1.5}
 main{padding:34px 0 70px}
 h2{font-size:22px;color:var(--lime);margin:44px 0 6px;font-weight:700}
 h2::before{content:"## ";color:var(--lime2);opacity:.6}
@@ -78,7 +87,16 @@ footer{margin-top:50px;padding-top:20px;border-top:2px dotted var(--lime2);color
     <a class="btn" href="https://github.com/luizcf14/BE220-GPLMods/archive/refs/heads/main.zip">Download as .zip</a>
     <a class="btn" href="https://github.com/luizcf14/BE220-GPLMods">View on GitHub</a>
   </div>
-  <nav class="toc"><a href="#requisitos">requisitos</a><a href="#flash">gravação</a><a href="#pos">pós-flash</a><a href="#problemas">problemas</a></nav>
+  <nav class="toc"><a href="#requisitos">requisitos</a><a href="#flash">gravação</a><a href="#pos">pós-flash</a><a href="#guias">documentação</a><a href="#problemas">problemas</a></nav>
+  <nav class="docs-nav">
+    <a href="index.html" class="active">Início</a>
+    <a href="rescue-mode.html">Rescue Mode</a>
+    <a href="dual-bank.html">Dual-Bank &amp; UBI</a>
+    <a href="uart-unlock.html">UART &amp; RootFS</a>
+    <a href="ssh-upgrade.html">Upgrade via SSH</a>
+    <a href="build-system.html">Build &amp; OpenWrt</a>
+    <a href="cloud-controller.html">Cloud Controller</a>
+  </nav>
 </div></header>
 
 <main class="wrap">
@@ -90,9 +108,9 @@ footer{margin-top:50px;padding-top:20px;border-top:2px dotted var(--lime2);color
   <li>Pacote genérico: sem chave SSH, senha <code>changeme</code></li>
 </ul>
 <div class="meta">
-  <div>última build<b>2026-10-28 11:58</b></div>
+  <div>última build<b>2026-10-28 14:29</b></div>
   <div>tamanho<b>34.9 MB</b></div>
-  <div>sha-256<b>b5134ad8f336d393e85510847fc126503c4d4063bc7fb5ecdd2711e454ce7e0d</b></div>
+  <div>sha-256<b>f53f75f96f11bee372cf80b89cf95882cc9541460e47dfe8d6edf21e54fcaf2e</b></div>
 </div>
 <section id="requisitos">
   <h2>Antes de começar</h2>
@@ -162,7 +180,7 @@ setenv bootcmd "test_mode enable; sdk boot_img"
 saveenv
 reset</code></pre></li>
     </ol>
-    <div class="note warn"><span>ℹ️</span><span>O <code>&lt;TAMANHO_HEX&gt;</code> é impresso ao final do <code>build_rootfs.sh</code>. Veja o <a href="https://github.com/luizcf14/BE220-GPLMods/blob/main/Guides/archer_be220_dual_bank_partition_guide.md">guia de partições</a> para o modo expandido (~66 MB).</span></div>
+    <div class="note warn"><span>ℹ️</span><span>O <code>&lt;TAMANHO_HEX&gt;</code> é impresso ao final do <code>build_rootfs.sh</code>. Veja o <a href="dual-bank.html">guia de partições Dual-Bank</a> para o modo expandido (~66 MB).</span></div>
   </div>
 </section>
 
@@ -184,6 +202,36 @@ uci commit floresta_cloud
 /etc/init.d/floresta_agent restart</code></pre></li>
     </ol>
     <div class="note ok"><span>✅</span><span>O agente restaura automaticamente configurações salvas em <code>/data</code> após um factory reset. A versão é fixada em <code>77.0.1</code> e o OTA oficial da TP-Link é bloqueado.</span></div>
+  </div>
+</section>
+
+<section id="guias">
+  <h2>Documentação técnica <small>Guias completos de engenharia reversa, partições, build e controlador em nuvem.</small></h2>
+  <div class="guides-grid">
+    <a class="guide-card" href="rescue-mode.html">
+      <b>Rescue Mode (WPS Web UI) →</b>
+      <span>Fluxo HTTP do U-Boot, cabeçalho TP-Link (0x1014 + fwup-ptn), pacote Broadcom FIT e descriptografia RSA-PSS/AES-128.</span>
+    </a>
+    <a class="guide-card" href="dual-bank.html">
+      <b>Arquitetura Dual-Bank &amp; UBI →</b>
+      <span>Mapeamento MTD de 128 MB, Slots A/B (rootfs1/rootfs2), espelhamento de partições e modo expandido (~66 MB).</span>
+    </a>
+    <a class="guide-card" href="uart-unlock.html">
+      <b>Desbloqueio UART &amp; RootFS →</b>
+      <span>Pinagem serial (ttyAMA0), test_mode enable, backup de 128 MB, flag secreta -L do Dropbear e correção do devpts.</span>
+    </a>
+    <a class="guide-card" href="ssh-upgrade.html">
+      <b>Upgrade via SSH (bcm_flasher) →</b>
+      <span>Atualização remota no slot inativo e engenharia reversa do requisito upfileoffset = 512 bytes.</span>
+    </a>
+    <a class="guide-card" href="build-system.html">
+      <b>Sistema de Build &amp; OpenWrt →</b>
+      <span>Pipeline do build_rootfs.sh, generate_recovery_bundle.sh, árvore Iplatform e SDK Broadcom BCM6764.</span>
+    </a>
+    <a class="guide-card" href="cloud-controller.html">
+      <b>Floresta Cloud Controller →</b>
+      <span>Gerenciamento centralizado via WebSocket, túnel reverso WebUI, terminal web xterm.js, RBAC e Portal Cativo QoS.</span>
+    </a>
   </div>
 </section>
 

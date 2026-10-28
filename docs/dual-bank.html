@@ -1,0 +1,181 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Arquitetura Dual-Bank (A/B) e Partições MTD/UBI — TP-Link Archer BE220</title>
+<meta name="description" content="Funcionamento da arquitetura Dual-Bank (Slots A e B), mapeamento de partições NAND/UBI e espelhamento de rootfs1/rootfs2 no Archer BE220.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+:root{
+  --bg:#141414; --panel:#1b1b1b; --line:#2c2c2c; --text:#d3d3d3; --muted:#7a7a7a;
+  --lime:#c3f02b; --lime2:#9cc41f; --warn:#e8c14d; --bad:#e36b5b; --ok:#8fd14f;
+}
+*{box-sizing:border-box}
+html{scroll-behavior:smooth}
+body{margin:0;color:var(--text);font:15px/1.75 'JetBrains Mono','Inconsolata',ui-monospace,Menlo,Consolas,monospace;
+  background-color:var(--bg);
+  background-image:repeating-linear-gradient(45deg,rgba(255,255,255,.018) 0 2px,transparent 2px 4px),
+                   radial-gradient(1200px 400px at 50% -100px,rgba(195,240,43,.07),transparent 70%)}
+a{color:var(--lime);text-decoration:none} a:hover{text-decoration:underline}
+.wrap{max-width:820px;margin:0 auto;padding:0 22px}
+header.top{padding:44px 0 26px;border-bottom:2px dotted var(--lime2)}
+.logo{font-size:30px;font-weight:700;color:var(--lime);margin:0;letter-spacing:-.01em}
+.logo i{font-style:normal;color:var(--lime2)}
+.tag{margin:6px 0 20px;color:var(--muted);font-size:17px;font-weight:600}
+.btns{display:flex;gap:10px;flex-wrap:wrap}
+.btn{display:inline-flex;align-items:center;gap:8px;padding:9px 18px;border-radius:999px;font:600 12.5px 'JetBrains Mono',monospace;
+  color:#fff;background:linear-gradient(#3a3a3a,#232323);border:1px solid #444;box-shadow:0 2px 0 #000,inset 0 1px 0 rgba(255,255,255,.12);transition:.15s}
+.btn:hover{text-decoration:none;color:var(--lime);transform:translateY(-1px)}
+.btn.main{background:linear-gradient(#d6ff4a,#a6d014);color:#16200a;border-color:#b6e32b}
+.btn.main:hover{color:#000}
+nav.docs-nav{margin-top:20px;padding-top:14px;border-top:1px dashed #333;display:flex;gap:14px;flex-wrap:wrap;font-size:12.5px}
+nav.docs-nav a{color:var(--muted);padding:4px 10px;border-radius:6px;border:1px solid transparent}
+nav.docs-nav a:hover{color:var(--lime);border-color:#333;text-decoration:none}
+nav.docs-nav a.active{color:var(--lime);background:#1f2612;border-color:var(--lime2)}
+main{padding:34px 0 70px}
+h2{font-size:22px;color:var(--lime);margin:44px 0 6px;font-weight:700}
+h2::before{content:"## ";color:var(--lime2);opacity:.6}
+h3{font-size:16px;color:#fff;margin:24px 0 6px}
+p{margin:12px 0}
+.lead{color:var(--lime);font-size:16px}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:20px 22px;margin-top:16px}
+ul.arrows,.steps{list-style:none;margin:12px 0;padding:0}
+ul.arrows li{position:relative;padding-left:30px;margin:6px 0}
+ul.arrows li::before,.steps>li::before{content:">>";position:absolute;left:0;color:var(--lime);font-weight:700}
+.steps{counter-reset:s}
+.steps>li{counter-increment:s;position:relative;padding:2px 0 16px 46px}
+.steps>li::before{content:counter(s,decimal-leading-zero);top:2px}
+pre{margin:10px 0 0;padding:14px 16px;background:#0e0e0e;border:1px solid var(--line);border-left:3px solid var(--lime2);border-radius:6px;overflow:auto;
+  font:13px/1.6 'JetBrains Mono',monospace;color:#e5e5e5}
+code{font-family:inherit;font-size:.92em;color:var(--lime);background:#0e0e0e;padding:1px 6px;border-radius:4px;border:1px solid #262626}
+pre code{background:none;border:0;padding:0;color:inherit}
+.note{padding:12px 16px;border-radius:8px;margin-top:14px;font-size:13.5px;border-left:3px solid;background:#181818}
+.note.warn{border-color:var(--warn)} .note.bad{border-color:var(--bad)} .note.ok{border-color:var(--ok)}
+table{width:100%;border-collapse:collapse;margin-top:8px;font-size:13.5px}
+td,th{text-align:left;padding:10px 10px;border-bottom:1px dotted #3a3a3a;vertical-align:top}
+th{color:var(--lime2);font-weight:600}
+footer{margin-top:50px;padding-top:20px;border-top:2px dotted var(--lime2);color:var(--muted);font-size:12.5px}
+</style>
+</head>
+<body>
+<header class="top"><div class="wrap">
+  <h1 class="logo"><i>./</i> Archer-BE220 <i>/ dual-bank</i></h1>
+  <p class="tag">Arquitetura Dual-Bank (A/B) e Gerenciamento de Partições MTD/UBI</p>
+  <div class="btns">
+    <a class="btn main" href="index.html">← Início &amp; Download</a>
+    <a class="btn" href="https://github.com/luizcf14/BE220-GPLMods">View on GitHub</a>
+  </div>
+  <nav class="docs-nav">
+    <a href="index.html">Início</a>
+    <a href="rescue-mode.html">Rescue Mode</a>
+    <a href="dual-bank.html" class="active">Dual-Bank &amp; UBI</a>
+    <a href="uart-unlock.html">UART &amp; RootFS</a>
+    <a href="ssh-upgrade.html">Upgrade via SSH</a>
+    <a href="build-system.html">Build &amp; OpenWrt</a>
+    <a href="cloud-controller.html">Cloud Controller</a>
+  </nav>
+</div></header>
+
+<main class="wrap">
+<p class="lead">Redundância de slots A/B na Flash SPI-NAND de 128 MB do Broadcom BCM6764.</p>
+<p>A plataforma Broadcom BCA utiliza dois bancos lógicos independentes (Slot 1 e Slot 2) controlados pelas partições <code>metadata1</code> e <code>metadata2</code> para garantir tolerância a falhas.</p>
+
+<section id="visao-geral">
+  <h2>1. Visão Geral da Arquitetura Dual-Bank</h2>
+  <div class="card">
+    <ul class="arrows">
+      <li><b>Slot 1 (Bank A — Primário):</b> Contém <code>bootfs1</code> (Kernel Linux FIT) e <code>rootfs1</code> (SquashFS).</li>
+      <li><b>Slot 2 (Bank B — Backup):</b> Contém <code>bootfs2</code> (Kernel Linux FIT) e <code>rootfs2</code> (SquashFS).</li>
+      <li><b>Metadados (<code>metadata1</code> / <code>metadata2</code>):</b> Armazenam <code>committed-img</code> (1 ou 2), <code>valid-imgs</code> e número de sequência incremental.</li>
+    </ul>
+  </div>
+</section>
+
+<section id="mtd">
+  <h2>2. Mapeamento Completo de Partições (<code>/proc/mtd</code>)</h2>
+  <div class="card">
+<pre><code>dev:    size   erasesize  name
+mtd0: 08000000 00020000 "spi1.0"      -> Flash NAND SPI inteira (128 MB)
+mtd1: 00200000 00020000 "loader"      -> Bootloader U-Boot + TPL (2 MB)
+mtd2: 07280000 00020000 "image"       -> Contêiner UBI principal (~114.5 MB)
+mtd3: 00380000 00020000 "tpconfig"    -> NVRAM de fábrica tp_data (PIN, MAC, Calibração)
+mtd4: 00700000 00020000 "userconfig"  -> Configurações persistentes do usuário
+mtd5: 00000110 0001f000 "metadata1"   -> Metadados de boot do Slot 1
+mtd6: 00000110 0001f000 "metadata2"   -> Metadados de boot do Slot 2
+mtd7: 006e4780 0001f000 "bootfs1"     -> Kernel + DTBs do Slot 1 (~6.9 MB)
+mtd8: 01aa4000 0001f000 "rootfs1"     -> RootFS SquashFS do Slot 1 (limite 33.1 MB)
+mtd9: 006e4780 0001f000 "bootfs2"     -> Kernel + DTBs do Slot 2 (~6.9 MB)
+mtd10: 01ac3000 0001f000 "rootfs2"    -> RootFS SquashFS do Slot 2 (limite 33.1 MB)
+mtd11: 0020f000 0001f000 "data"       -> Partição persistente /data (UBIFS)
+mtd12: 00117000 0001f000 "defaults"   -> Padrões de fábrica
+mtd13: 0026c000 0001f000 "tp_data"    -> Dados adicionais de calibração
+mtd14: 002e8000 0001f000 "user_data1" -> Dados do usuário no Slot 1
+mtd15: 002e8000 0001f000 "user_data2" -> Dados do usuário no Slot 2</code></pre>
+  </div>
+</section>
+
+<section id="espelhar">
+  <h2>3. Como Espelhar o Firmware no Slot 2 (<code>rootfs2</code>)</h2>
+  <div class="card">
+    <p>O Rescue Mode grava apenas o <b>Slot 1</b> (<code>bootfs1</code> e <code>rootfs1</code>). Para espelhar a mesma imagem no Slot 2:</p>
+    <h3>Método A: Pelo Linux Ativo via SSH</h3>
+<pre><code># 1. No PC, envie a imagem para /tmp:
+scp -O rootfs1_mod.bin root@192.168.0.1:/tmp/
+
+# 2. No roteador via SSH, identifique o volume UBI do rootfs2:
+for v in /sys/class/ubi/ubi0_*; do
+    [ -f "$v/name" ] &amp;&amp; echo "$v -&gt; $(cat "$v/name")"
+done
+
+# 3. Grave no dispositivo correspondente ao rootfs2 (ex: /dev/ubi0_3):
+ubiupdatevol /dev/ubi0_3 /tmp/rootfs1_mod.bin
+ubinfo /dev/ubi0_3
+rm -f /tmp/rootfs1_mod.bin &amp;&amp; sync</code></pre>
+
+    <h3>Método B: Pelo U-Boot via TFTP (Serial UART)</h3>
+<pre><code>setenv ipaddr 192.168.12.1; setenv serverip 192.168.12.2; setenv netmask 255.255.255.0
+ubi part image
+tftpboot 0x05000000 rootfs1_mod.bin
+ubi write 0x05000000 rootfs1 &lt;TAMANHO_HEX&gt;
+ubi write 0x05000000 rootfs2 &lt;TAMANHO_HEX&gt;
+setenv bootcmd "test_mode enable; sdk boot_img"
+saveenv; reset</code></pre>
+  </div>
+</section>
+
+<section id="alternar">
+  <h2>4. Como Alternar o Slot Ativo de Boot no U-Boot</h2>
+  <div class="card">
+<pre><code># Forçar Boot pelo Slot 1:
+setenv boot_image 1; setenv committed_image 1; saveenv; reset
+
+# Forçar Boot pelo Slot 2:
+setenv boot_image 2; setenv committed_image 2; saveenv; reset</code></pre>
+    <div class="note ok"><span>✅</span><span>Se o slot selecionado falhar na verificação de integridade, o watchdog do U-Boot alterna automaticamente de volta para o slot íntegro.</span></div>
+  </div>
+</section>
+
+<section id="comparativo">
+  <h2>5. Dual-Bank (33 MB) vs Modo Expandido (66 MB)</h2>
+  <div class="card">
+    <table>
+      <tr><th>Recurso</th><th>Dual-Bank Padrão (Opção 1)</th><th>Expandido ~66 MB (Opção 2)</th></tr>
+      <tr><td>Limite do RootFS</td><td><b>33,1 MB</b> (<code>33.140.736 B</code>)</td><td><b>~66,2 MB</b> (<code>66.281.472 B</code>)</td></tr>
+      <tr><td>Slot B (<code>rootfs2</code>)</td><td>Preservado para contingência</td><td>Removido (<code>ubi remove rootfs2</code>)</td></tr>
+      <tr><td>Compatível com Rescue Mode</td><td><b>Sim (100%)</b></td><td>Não (exige UART/TFTP)</td></tr>
+      <tr><td>Uso recomendado</td><td>Produção e resiliência a falhas</td><td>Laboratório com pacotes pesados</td></tr>
+    </table>
+  </div>
+</section>
+
+<footer>
+  Documentação técnica — TP-Link Archer BE220 / BCM6764.<br>
+  <a href="index.html">← Voltar ao Início</a> · <a href="https://github.com/luizcf14/BE220-GPLMods">github.com/luizcf14/BE220-GPLMods</a>
+</footer>
+</main>
+</body>
+</html>
+

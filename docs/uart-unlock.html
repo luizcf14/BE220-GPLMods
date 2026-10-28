@@ -1,0 +1,160 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Desbloqueio UART, RootFS e SSH (Dropbear) — TP-Link Archer BE220</title>
+<meta name="description" content="Guia técnico completo de desbloqueio da console serial UART (test_mode enable), backup de 128 MB e ativação permanente de SSH (flag -L e devpts) no Archer BE220.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+:root{
+  --bg:#141414; --panel:#1b1b1b; --line:#2c2c2c; --text:#d3d3d3; --muted:#7a7a7a;
+  --lime:#c3f02b; --lime2:#9cc41f; --warn:#e8c14d; --bad:#e36b5b; --ok:#8fd14f;
+}
+*{box-sizing:border-box}
+html{scroll-behavior:smooth}
+body{margin:0;color:var(--text);font:15px/1.75 'JetBrains Mono','Inconsolata',ui-monospace,Menlo,Consolas,monospace;
+  background-color:var(--bg);
+  background-image:repeating-linear-gradient(45deg,rgba(255,255,255,.018) 0 2px,transparent 2px 4px),
+                   radial-gradient(1200px 400px at 50% -100px,rgba(195,240,43,.07),transparent 70%)}
+a{color:var(--lime);text-decoration:none} a:hover{text-decoration:underline}
+.wrap{max-width:820px;margin:0 auto;padding:0 22px}
+header.top{padding:44px 0 26px;border-bottom:2px dotted var(--lime2)}
+.logo{font-size:30px;font-weight:700;color:var(--lime);margin:0;letter-spacing:-.01em}
+.logo i{font-style:normal;color:var(--lime2)}
+.tag{margin:6px 0 20px;color:var(--muted);font-size:17px;font-weight:600}
+.btns{display:flex;gap:10px;flex-wrap:wrap}
+.btn{display:inline-flex;align-items:center;gap:8px;padding:9px 18px;border-radius:999px;font:600 12.5px 'JetBrains Mono',monospace;
+  color:#fff;background:linear-gradient(#3a3a3a,#232323);border:1px solid #444;box-shadow:0 2px 0 #000,inset 0 1px 0 rgba(255,255,255,.12);transition:.15s}
+.btn:hover{text-decoration:none;color:var(--lime);transform:translateY(-1px)}
+.btn.main{background:linear-gradient(#d6ff4a,#a6d014);color:#16200a;border-color:#b6e32b}
+.btn.main:hover{color:#000}
+nav.docs-nav{margin-top:20px;padding-top:14px;border-top:1px dashed #333;display:flex;gap:14px;flex-wrap:wrap;font-size:12.5px}
+nav.docs-nav a{color:var(--muted);padding:4px 10px;border-radius:6px;border:1px solid transparent}
+nav.docs-nav a:hover{color:var(--lime);border-color:#333;text-decoration:none}
+nav.docs-nav a.active{color:var(--lime);background:#1f2612;border-color:var(--lime2)}
+main{padding:34px 0 70px}
+h2{font-size:22px;color:var(--lime);margin:44px 0 6px;font-weight:700}
+h2::before{content:"## ";color:var(--lime2);opacity:.6}
+h3{font-size:16px;color:#fff;margin:24px 0 6px}
+p{margin:12px 0}
+.lead{color:var(--lime);font-size:16px}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:20px 22px;margin-top:16px}
+ul.arrows,.steps{list-style:none;margin:12px 0;padding:0}
+ul.arrows li{position:relative;padding-left:30px;margin:6px 0}
+ul.arrows li::before,.steps>li::before{content:">>";position:absolute;left:0;color:var(--lime);font-weight:700}
+.steps{counter-reset:s}
+.steps>li{counter-increment:s;position:relative;padding:2px 0 16px 46px}
+.steps>li::before{content:counter(s,decimal-leading-zero);top:2px}
+pre{margin:10px 0 0;padding:14px 16px;background:#0e0e0e;border:1px solid var(--line);border-left:3px solid var(--lime2);border-radius:6px;overflow:auto;
+  font:13px/1.6 'JetBrains Mono',monospace;color:#e5e5e5}
+code{font-family:inherit;font-size:.92em;color:var(--lime);background:#0e0e0e;padding:1px 6px;border-radius:4px;border:1px solid #262626}
+pre code{background:none;border:0;padding:0;color:inherit}
+.note{padding:12px 16px;border-radius:8px;margin-top:14px;font-size:13.5px;border-left:3px solid;background:#181818}
+.note.warn{border-color:var(--warn)} .note.bad{border-color:var(--bad)} .note.ok{border-color:var(--ok)}
+table{width:100%;border-collapse:collapse;margin-top:8px;font-size:13.5px}
+td,th{text-align:left;padding:10px 10px;border-bottom:1px dotted #3a3a3a;vertical-align:top}
+th{color:var(--lime2);font-weight:600}
+footer{margin-top:50px;padding-top:20px;border-top:2px dotted var(--lime2);color:var(--muted);font-size:12.5px}
+</style>
+</head>
+<body>
+<header class="top"><div class="wrap">
+  <h1 class="logo"><i>./</i> Archer-BE220 <i>/ uart-unlock</i></h1>
+  <p class="tag">Desbloqueio de Console Serial (UART), Backup NAND e RootFS com SSH</p>
+  <div class="btns">
+    <a class="btn main" href="index.html">← Início &amp; Download</a>
+    <a class="btn" href="https://github.com/luizcf14/BE220-GPLMods">View on GitHub</a>
+  </div>
+  <nav class="docs-nav">
+    <a href="index.html">Início</a>
+    <a href="rescue-mode.html">Rescue Mode</a>
+    <a href="dual-bank.html">Dual-Bank &amp; UBI</a>
+    <a href="uart-unlock.html" class="active">UART &amp; RootFS</a>
+    <a href="ssh-upgrade.html">Upgrade via SSH</a>
+    <a href="build-system.html">Build &amp; OpenWrt</a>
+    <a href="cloud-controller.html">Cloud Controller</a>
+  </nav>
+</div></header>
+
+<main class="wrap">
+<p class="lead">Engenharia reversa do bloqueio serial, flag secreta do Dropbear (<code>-L</code>) e correção do PTY.</p>
+
+<section id="serial">
+  <h2>1. Conexão Serial USB-TTL e Desbloqueio no U-Boot</h2>
+  <div class="card">
+    <ul class="arrows">
+      <li><b>Parâmetros:</b> <code>115200 8N1</code>, Flow Control OFF (console <code>ttyAMA0</code> — ARM PrimeCell PL011).</li>
+      <li><b>Pinagem:</b> <code>TX → RX</code>, <code>RX → TX</code>, <code>GND → GND</code> (<b>nunca</b> conecte o pino VCC).</li>
+    </ul>
+    <p>Por padrão, o U-Boot passa <code>test_mode=disable</code> ao kernel e os módulos <code>user-debug</code> / <code>kmonitor</code> bloqueiam o RX da serial. Para desbloquear no prompt <code>=&gt;</code> do U-Boot:</p>
+<pre><code>test_mode enable
+sdk boot_img</code></pre>
+    <p>Para tornar permanente no ambiente do U-Boot:</p>
+<pre><code>setenv bootcmd "test_mode enable; sdk boot_img"
+saveenv</code></pre>
+  </div>
+</section>
+
+<section id="backup">
+  <h2>2. Backup Completo de 128 MB (SPI-NAND <code>mtd0</code>)</h2>
+  <div class="card">
+    <p>Antes de qualquer alteração, extraia os 128 MB (<code>134.217.728 bytes</code>) da flash via socket TCP no PowerShell (PC em <code>192.168.12.2</code>):</p>
+<pre><code># No Windows (PowerShell):
+$listener = New-Object System.Net.Sockets.TcpListener ([System.Net.IPAddress]::Any, 8080)
+$listener.Start()
+$client = $listener.AcceptTcpClient()
+$stream = $client.GetStream()
+$file = [System.IO.File]::Create("$HOME\Downloads\archer_be220_full_dump.bin")
+$stream.CopyTo($file)
+$file.Close(); $client.Close(); $listener.Stop()</code></pre>
+<pre><code># No roteador:
+cat /dev/mtd0 | nc 192.168.12.2 8080</code></pre>
+  </div>
+</section>
+
+<section id="pegadinhas">
+  <h2>3. As 4 Armadilhas Proprietárias Descobertas no RootFS</h2>
+  <div class="card">
+    <h3>3.1 Hash da senha exigido também em <code>/etc/passwd</code></h3>
+    <p>O binário do Dropbear da TP-Link lê o hash diretamente de <code>/etc/passwd</code>. Se contiver <code>root:x:...</code>, a autenticação falha com <code>User account 'root' is locked</code>. O hash MD5-crypt deve estar tanto em <code>/etc/shadow</code> quanto em <code>/etc/passwd</code>.</p>
+
+    <h3>3.2 O Boot Hook Real: <code>/etc/rc.d/S99zzzzboot_done</code></h3>
+    <p>A TP-Link removeu <code>/etc/init.d/done</code>, logo <code>/etc/rc.local</code> nunca é executado. O único script final chamado pelo <code>rcS</code> no término do boot é <code>/etc/rc.d/S99zzzzboot_done</code>.</p>
+
+    <h3>3.3 A Flag Secreta do Dropbear (<code>-L</code>)</h3>
+    <p>A TP-Link alterou o código C do Dropbear (<code>svr-runopts.c</code> e <code>svr-chansession.c</code>) adicionando a trava <code>svr_opts.sessionEnable == 0</code>. Sem a flag <code>-L</code>, o Dropbear aceita a senha mas rejeita silenciosamente qualquer pedido de <code>pty-req</code>, <code>shell</code> ou <code>exec</code>:</p>
+<pre><code>/usr/sbin/dropbear -p 22 -L -B &amp;</code></pre>
+
+    <h3>3.4 Pseudoterminal (<code>/dev/ptmx</code> e <code>devpts</code>)</h3>
+    <p>O kernel monta <code>/dev/pts</code> com <code>ptmxmode=000</code> e <code>/dev/ptmx</code> é um nó estático inoperante. No boot (<code>S99zzzzboot_done</code>), remontamos com permissão <code>666</code> e recriamos o link simbólico:</p>
+<pre><code>mkdir -p /var/dropbear /dev/pts
+rm -f /var/dropbear/fail_count
+mount -o remount,mode=666,ptmxmode=666 /dev/pts 2&gt;/dev/null || true
+rm -f /dev/ptmx
+ln -sf pts/ptmx /dev/ptmx
+chmod 666 /dev/pts/ptmx /dev/ptmx 2&gt;/dev/null || true
+/usr/sbin/dropbear -p 22 -L -B &amp;</code></pre>
+    <div class="note bad"><span>⚠️</span><span><b>Importante:</b> Nunca faça symlink de <code>/var/dropbear/fail_count</code> para <code>/dev/null</code> (o <code>fscanf()</code> entra em loop infinito). Use apenas <code>rm -f /var/dropbear/fail_count</code>.</span></div>
+  </div>
+</section>
+
+<section id="build">
+  <h2>4. Reconstrução Automatizada com <code>build_rootfs.sh</code></h2>
+  <div class="card">
+    <div class="note warn"><span>⚠️</span><span><b>NTFS vs ext4:</b> Extrair o SquashFS em uma partição Windows NTFS (<code>/mnt/f/...</code>) descarta os 459 symlinks do Linux e causa <code>Kernel panic: Requested init /etc/preinit failed (error -2)</code>. O script <code>build_rootfs.sh</code> faz toda a extração em <code>/tmp/be220_squashfs_work</code> (ext4 nativo do WSL2).</span></div>
+<pre><code># Build padrão no WSL2 (SquashFS XZ, block size 1 MB):
+wsl -d Ubuntu-24.04 bash build_rootfs.sh</code></pre>
+  </div>
+</section>
+
+<footer>
+  Documentação técnica — TP-Link Archer BE220 / BCM6764.<br>
+  <a href="index.html">← Voltar ao Início</a> · <a href="https://github.com/luizcf14/BE220-GPLMods">github.com/luizcf14/BE220-GPLMods</a>
+</footer>
+</main>
+</body>
+</html>
+
