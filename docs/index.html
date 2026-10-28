@@ -1,0 +1,213 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Como gravar o firmware — TP-Link Archer BE220 (Floresta)</title>
+<meta name="description" content="Guia passo a passo para gravar o recovery_bundle no TP-Link Archer BE220 via Rescue Mode (WPS), SSH ou U-Boot/TFTP.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+:root{
+  --bg:#070b14; --panel:rgba(255,255,255,.04); --line:rgba(255,255,255,.09);
+  --text:#e6ebf5; --muted:#8e9ab3; --a:#34d399; --b:#22d3ee; --warn:#fbbf24; --bad:#f87171;
+}
+*{box-sizing:border-box}
+html{scroll-behavior:smooth}
+body{margin:0;background:var(--bg);color:var(--text);font:16px/1.65 Inter,system-ui,sans-serif;
+  background-image:radial-gradient(900px 500px at 10% -10%,rgba(52,211,153,.14),transparent 60%),
+  radial-gradient(800px 500px at 100% 0,rgba(34,211,238,.12),transparent 60%);background-attachment:fixed}
+a{color:var(--b);text-decoration:none} a:hover{text-decoration:underline}
+header.nav{position:sticky;top:0;z-index:10;backdrop-filter:blur(14px);background:rgba(7,11,20,.7);border-bottom:1px solid var(--line)}
+.nav .in{max-width:1000px;margin:auto;padding:14px 24px;display:flex;gap:22px;align-items:center;flex-wrap:wrap}
+.brand{font-weight:800;letter-spacing:-.02em;margin-right:auto}
+.brand span{background:linear-gradient(90deg,var(--a),var(--b));-webkit-background-clip:text;color:transparent}
+.nav a.l{color:var(--muted);font-size:14px;font-weight:500}
+main{max-width:1000px;margin:auto;padding:0 24px 80px}
+.hero{padding:72px 0 40px;text-align:center}
+.pill{display:inline-block;padding:6px 14px;border:1px solid var(--line);border-radius:999px;background:var(--panel);color:var(--muted);font-size:13px}
+h1{font-size:clamp(34px,6vw,58px);line-height:1.08;margin:20px 0 14px;letter-spacing:-.035em;font-weight:800}
+h1 em{font-style:normal;background:linear-gradient(90deg,var(--a),var(--b));-webkit-background-clip:text;color:transparent}
+.hero p{color:var(--muted);max-width:640px;margin:0 auto 30px;font-size:18px}
+.btn{display:inline-flex;align-items:center;gap:10px;padding:14px 26px;border-radius:14px;font-weight:700;color:#04110c;
+  background:linear-gradient(90deg,var(--a),var(--b));box-shadow:0 10px 40px -10px rgba(52,211,153,.6);transition:.2s}
+.btn:hover{transform:translateY(-2px);text-decoration:none;box-shadow:0 14px 50px -8px rgba(34,211,238,.7)}
+.btn.ghost{background:var(--panel);color:var(--text);border:1px solid var(--line);box-shadow:none;margin-left:10px}
+.meta{display:flex;gap:14px;justify-content:center;flex-wrap:wrap;margin-top:26px}
+.meta div{padding:10px 16px;border:1px solid var(--line);border-radius:12px;background:var(--panel);font-size:13px;color:var(--muted)}
+.meta b{display:block;color:var(--text);font-family:'JetBrains Mono',monospace;font-weight:500;font-size:12.5px;word-break:break-all}
+section{margin-top:56px}
+h2{font-size:28px;letter-spacing:-.02em;margin:0 0 6px}
+h2 small{display:block;color:var(--muted);font-size:15px;font-weight:400;margin-top:4px}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:18px;padding:26px;margin-top:18px}
+.steps{counter-reset:s;list-style:none;margin:0;padding:0}
+.steps>li{counter-increment:s;position:relative;padding:4px 0 18px 54px}
+.steps>li::before{content:counter(s);position:absolute;left:0;top:0;width:36px;height:36px;border-radius:11px;display:grid;place-items:center;
+  font-weight:800;color:#04110c;background:linear-gradient(135deg,var(--a),var(--b))}
+.steps>li:not(:last-child)::after{content:"";position:absolute;left:17px;top:42px;bottom:2px;width:2px;background:var(--line)}
+pre{margin:10px 0 0;padding:16px 18px;background:#0a1020;border:1px solid var(--line);border-radius:12px;overflow:auto;
+  font:13.5px/1.6 'JetBrains Mono',monospace;color:#cfe3ff}
+code{font-family:'JetBrains Mono',monospace;font-size:.88em;background:rgba(255,255,255,.07);padding:2px 7px;border-radius:6px}
+pre code{background:none;padding:0}
+.note{display:flex;gap:12px;padding:14px 18px;border-radius:14px;margin-top:16px;font-size:15px;border:1px solid}
+.note.warn{background:rgba(251,191,36,.07);border-color:rgba(251,191,36,.35)}
+.note.bad{background:rgba(248,113,113,.07);border-color:rgba(248,113,113,.4)}
+.note.ok{background:rgba(52,211,153,.07);border-color:rgba(52,211,153,.35)}
+.tabs{display:flex;gap:8px;flex-wrap:wrap;margin-top:18px}
+.tab{padding:9px 16px;border-radius:10px;border:1px solid var(--line);background:var(--panel);color:var(--muted);cursor:pointer;font:600 14px Inter}
+.tab.on{color:#04110c;background:linear-gradient(90deg,var(--a),var(--b));border-color:transparent}
+.pane{display:none}.pane.on{display:block;animation:f .35s ease}
+@keyframes f{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
+table{width:100%;border-collapse:collapse;margin-top:14px;font-size:14.5px}
+td,th{text-align:left;padding:11px 12px;border-bottom:1px solid var(--line);vertical-align:top}
+th{color:var(--muted);font-weight:600;font-size:13px}
+footer{margin-top:70px;padding-top:26px;border-top:1px solid var(--line);color:var(--muted);font-size:13px;text-align:center}
+</style>
+</head>
+<body>
+<header class="nav"><div class="in">
+  <div class="brand">Archer BE220 · <span>Floresta</span></div>
+  <a class="l" href="#requisitos">Requisitos</a><a class="l" href="#flash">Gravação</a>
+  <a class="l" href="#pos">Pós-flash</a><a class="l" href="#problemas">Problemas</a>
+  <a class="l" href="https://github.com/luizcf14/BE220-GPLMods">GitHub</a>
+</div></header>
+
+<main>
+<div class="hero">
+  <span class="pill">TP-Link Archer BE220 · BCM6764 · Wi-Fi 7</span>
+  <h1>Grave o firmware <em>customizado</em><br>em poucos minutos</h1>
+  <p>Sem abrir o roteador: use o Rescue Mode (botão WPS) e o pacote <code>recovery_bundle.bin</code> sempre atualizado neste repositório.</p>
+  <a class="btn" id="download" href="https://github.com/luizcf14/BE220-GPLMods/raw/main/releases/recovery_bundle.bin">⬇ Baixar recovery_bundle.bin</a>
+  <a class="btn ghost" href="https://github.com/luizcf14/BE220-GPLMods">Ver repositório</a>
+  <div class="meta">
+    <div>Última build<b>2026-10-28 11:43</b></div>
+    <div>Tamanho<b>34.9 MB</b></div>
+    <div>SHA-256<b>1454e8933de3cec26cfaf424a2a42f0ed237966bca4d2c52f6aeb236781ca7b3</b></div>
+  </div>
+</div>
+
+<section id="requisitos">
+  <h2>Antes de começar</h2>
+  <div class="card">
+    <table>
+      <tr><th>Item</th><th>Detalhe</th></tr>
+      <tr><td>Roteador</td><td>TP-Link Archer BE220 (também BE230 / BE3600 Pro com mesmo SoC — por sua conta e risco).</td></tr>
+      <tr><td>PC</td><td>Cabo Ethernet na <b>porta LAN 1</b> do roteador; IP estático <code>192.168.0.2</code> / <code>255.255.255.0</code> / gateway <code>192.168.0.1</code>.</td></tr>
+      <tr><td>Arquivo</td><td><code>recovery_bundle.bin</code> (link acima). Confira o SHA-256 antes de gravar.</td></tr>
+      <tr><td>Energia</td><td>Não desligue o roteador durante a gravação (≈ 3–5 min).</td></tr>
+    </table>
+    <div class="note warn"><span>⚠️</span><span>Gravar firmware modificado pode invalidar a garantia e, se interrompido, deixar o roteador sem boot. O Rescue Mode permite recuperar na maioria dos casos.</span></div>
+    <div class="note bad"><span>🔐</span><span>O bundle público é <b>genérico</b>: <b>não</b> tem chave SSH e a senha de root é <code>changeme</code>. Troque-a imediatamente (<code>passwd</code>) e aponte o roteador para o <i>seu</i> controlador (veja <a href="#pos">Pós-flash</a>).</span></div>
+  </div>
+</section>
+
+<section id="flash">
+  <h2>Gravação <small>Escolha um método — o Rescue Mode é o mais simples e seguro.</small></h2>
+  <div class="tabs">
+    <button class="tab on" data-t="p1">1 · Rescue Mode (WPS)</button>
+    <button class="tab" data-t="p2">2 · Via SSH</button>
+    <button class="tab" data-t="p3">3 · U-Boot / TFTP</button>
+  </div>
+
+  <div class="card pane on" id="p1">
+    <ol class="steps">
+      <li><b>Configure o IP do PC</b><br>Placa de rede com <code>192.168.0.2</code>, máscara <code>255.255.255.0</code>, gateway <code>192.168.0.1</code>. Cabo na LAN 1.</li>
+      <li><b>Desligue o roteador</b> (retire da tomada).</li>
+      <li><b>Entre no Rescue Mode</b><br>Mantenha o botão <b>WPS pressionado</b>, ligue o roteador e <b>continue segurando por 20 segundos</b>.</li>
+      <li><b>Abra a página de recuperação</b><br><a href="http://192.168.0.1">http://192.168.0.1</a></li>
+      <li><b>Envie o arquivo</b><br>Selecione <code>recovery_bundle.bin</code> e clique em <b>Upgrade</b>. Aguarde o roteador reiniciar sozinho (3–5 min).</li>
+      <li><b>Pronto!</b> Siga o <a href="#pos">Pós-flash</a>.</li>
+    </ol>
+    <div class="note warn"><span>ℹ️</span><span>A tela de Rescue valida o <b>cabeçalho TP-Link</b> do arquivo. Use exatamente o <code>recovery_bundle.bin</code> deste repositório (não o FIT “cru”).</span></div>
+  </div>
+
+  <div class="card pane" id="p2">
+    <p>Para quem já tem SSH no roteador (firmware customizado anterior). IP padrão: <code>192.168.0.1</code>.</p>
+    <ol class="steps">
+      <li><b>Envie o arquivo para a RAM</b> (Dropbear não tem SFTP, use <code>-O</code>)
+<pre><code>scp -O recovery_bundle.bin root@192.168.0.1:/tmp/</code></pre></li>
+      <li><b>Aplique o padding de 512 bytes e grave</b>
+<pre><code>ssh root@192.168.0.1
+dd if=/dev/zero of=/tmp/pad.bin bs=512 count=1 2&gt;/dev/null
+cat /tmp/pad.bin /tmp/recovery_bundle.bin &gt; /tmp/flash_bundle.bin
+rm -f /tmp/pad.bin
+FILESIZE=$(ls -l /tmp/flash_bundle.bin | awk '{print $5}')
+/sbin/bcm_flasher /tmp/flash_bundle.bin $FILESIZE 512</code></pre>
+        Aguarde <code>Image flash complete, you may reboot the board</code>.</li>
+      <li><b>Reinicie</b>
+<pre><code>reboot</code></pre></li>
+    </ol>
+  </div>
+
+  <div class="card pane" id="p3">
+    <p>Método avançado via console serial (UART 115200 8N1) e servidor TFTP — grava apenas o <code>rootfs</code>, a partir do arquivo <code>rootfs1_mod.bin</code> gerado com <code>build_rootfs.sh</code>.</p>
+    <ol class="steps">
+      <li><b>No PC</b>, IP <code>192.168.12.2</code> na porta WAN/2.5G e inicie o TFTP:
+<pre><code>python serve_tftp.py</code></pre></li>
+      <li><b>Interrompa o autoboot</b> do U-Boot (qualquer tecla) e execute:
+<pre><code>setenv ipaddr 192.168.12.1; setenv serverip 192.168.12.2; setenv netmask 255.255.255.0
+ping 192.168.12.2
+ubi part image
+tftpboot 0x05000000 rootfs1_mod.bin
+ubi write 0x05000000 rootfs1 &lt;TAMANHO_HEX&gt;
+setenv bootcmd "test_mode enable; sdk boot_img"
+saveenv
+reset</code></pre></li>
+    </ol>
+    <div class="note warn"><span>ℹ️</span><span>O <code>&lt;TAMANHO_HEX&gt;</code> é impresso ao final do <code>build_rootfs.sh</code>. Veja o <a href="https://github.com/luizcf14/BE220-GPLMods/blob/main/Guides/archer_be220_dual_bank_partition_guide.md">guia de partições</a> para o modo expandido (~66 MB).</span></div>
+  </div>
+</section>
+
+<section id="pos">
+  <h2>Pós-flash <small>Primeiro acesso e conexão ao seu controlador.</small></h2>
+  <div class="card">
+    <ol class="steps">
+      <li><b>Acesse</b> a WebUI em <a href="http://192.168.0.1">http://192.168.0.1</a> ou SSH:
+<pre><code>ssh root@192.168.0.1     # senha padrão: changeme</code></pre></li>
+      <li><b>Troque a senha de root</b>
+<pre><code>passwd</code></pre></li>
+      <li><b>(Opcional) Adicione sua chave SSH</b>
+<pre><code>echo "ssh-ed25519 AAAA... voce@pc" &gt;&gt; /etc/dropbear/authorized_keys</code></pre></li>
+      <li><b>Aponte para o seu Floresta Cloud Controller</b>
+<pre><code>set-inform https://&lt;SEU_CONTROLADOR&gt;/ws/router</code></pre>
+        ou manualmente:
+<pre><code>uci set floresta_cloud.global.server_url="https://&lt;SEU_CONTROLADOR&gt;/ws/router"
+uci commit floresta_cloud
+/etc/init.d/floresta_agent restart</code></pre></li>
+    </ol>
+    <div class="note ok"><span>✅</span><span>O agente restaura automaticamente configurações salvas em <code>/data</code> após um factory reset. A versão é fixada em <code>77.0.1</code> e o OTA oficial da TP-Link é bloqueado.</span></div>
+  </div>
+</section>
+
+<section id="problemas">
+  <h2>Solução de problemas</h2>
+  <div class="card">
+    <table>
+      <tr><th>Sintoma</th><th>Causa / solução</th></tr>
+      <tr><td><code>192.168.0.1</code> não abre</td><td>Confira IP estático do PC, cabo na LAN 1 e se segurou o WPS por 20 s <i>antes</i> de soltar. Repita o procedimento.</td></tr>
+      <tr><td>Rescue recusa o arquivo</td><td>Arquivo corrompido ou errado. Baixe novamente e confira o SHA-256; use o arquivo com cabeçalho TP-Link.</td></tr>
+      <tr><td>Reboot em loop após gravar</td><td>Reentre no Rescue Mode e grave novamente.</td></tr>
+      <tr><td><code>size &gt; volume size! Aborting!</code> (U-Boot)</td><td>O rootfs excede a partição (33,1 MB). Use o modo expandido ou reduza o conteúdo.</td></tr>
+      <tr><td>Sem acesso SSH</td><td>Use a senha padrão <code>changeme</code> ou o console serial (UART).</td></tr>
+    </table>
+  </div>
+</section>
+
+<footer>
+  Projeto educacional / pesquisa de segurança. Firmware de terceiros pertence aos respectivos detentores. Sem garantias.<br>
+  <a href="https://github.com/luizcf14/BE220-GPLMods">github.com/luizcf14/BE220-GPLMods</a>
+</footer>
+</main>
+
+<script>
+document.querySelectorAll('.tab').forEach(function(t){
+  t.addEventListener('click',function(){
+    document.querySelectorAll('.tab').forEach(function(x){x.classList.remove('on')});
+    document.querySelectorAll('.pane').forEach(function(x){x.classList.remove('on')});
+    t.classList.add('on');document.getElementById(t.dataset.t).classList.add('on');
+  });
+});
+</script>
+</body>
+</html>

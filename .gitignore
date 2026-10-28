@@ -1,6 +1,8 @@
 *.bin
+!releases/*.bin
 squashfs-root/
 scratch/
+build.local.env
 cookie.txt
 scratch_logs.json
 cloudController/data/

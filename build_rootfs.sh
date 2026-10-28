@@ -6,11 +6,17 @@ ORIGINAL_BIN="$SCRIPT_DIR/mtd8_rootfs1.bin"
 OUTPUT_BIN="$SCRIPT_DIR/rootfs1_mod.bin"
 WORK_DIR="/tmp/be220_squashfs_work"
 
-# Chave pública RSA do usuário
-USER_PUBKEY="<SSH_PUBLIC_KEY>"
-
-# Hash nativo gerado pelo proprio passwd do roteador para '<ROOT_PASSWORD>'
-ROOT_HASH='$1$1bCi1pXX$j6L4HRWFAIW.ji8lo7xGT/'
+# Credenciais de build. Para uso privado, crie 'build.local.env' (ignorado pelo git) com:
+#   SSH_PUBKEY="ssh-rsa AAAA... usuario@host"
+#   ROOT_PASSWORD="sua-senha"            (ou ROOT_HASH='$1$...' ja calculado)
+# Sem esse arquivo, gera-se uma imagem generica: SEM chave SSH e com a senha de
+# root padrao 'changeme' (TROQUE assim que acessar o roteador com 'passwd').
+[ -f "$SCRIPT_DIR/build.local.env" ] && . "$SCRIPT_DIR/build.local.env"
+USER_PUBKEY="${SSH_PUBKEY:-}"
+ROOT_PASSWORD="${ROOT_PASSWORD:-changeme}"
+if [ -z "${ROOT_HASH:-}" ]; then
+    ROOT_HASH="$(openssl passwd -1 "$ROOT_PASSWORD")"
+fi
 
 echo "=============================================="
 echo "  TP-Link Archer BE220 - RootFS Builder v3"
@@ -78,13 +84,17 @@ config cloud_account 'root'
 EOF
 
 # Patch 4: Injetar chave publica SSH do usuario
-echo "  [+] Gravando chave SSH RSA em /etc/dropbear e /root/.ssh..."
-mkdir -p "$WORK_DIR/etc/dropbear"
-mkdir -p "$WORK_DIR/root/.ssh"
-echo "$USER_PUBKEY" > "$WORK_DIR/etc/dropbear/authorized_keys"
-echo "$USER_PUBKEY" > "$WORK_DIR/root/.ssh/authorized_keys"
-chmod 700 "$WORK_DIR/etc/dropbear" "$WORK_DIR/root/.ssh"
-chmod 600 "$WORK_DIR/etc/dropbear/authorized_keys" "$WORK_DIR/root/.ssh/authorized_keys"
+if [ -n "$USER_PUBKEY" ]; then
+    echo "  [+] Gravando chave SSH RSA em /etc/dropbear e /root/.ssh..."
+    mkdir -p "$WORK_DIR/etc/dropbear"
+    mkdir -p "$WORK_DIR/root/.ssh"
+    echo "$USER_PUBKEY" > "$WORK_DIR/etc/dropbear/authorized_keys"
+    echo "$USER_PUBKEY" > "$WORK_DIR/root/.ssh/authorized_keys"
+    chmod 700 "$WORK_DIR/etc/dropbear" "$WORK_DIR/root/.ssh"
+    chmod 600 "$WORK_DIR/etc/dropbear/authorized_keys" "$WORK_DIR/root/.ssh/authorized_keys"
+else
+    echo "  [i] SSH_PUBKEY nao definida: imagem sem chave SSH (login por senha)."
+fi
 
 # Patch 5: Ajustar link simbolico do /dev/ptmx para devpts
 echo "  [+] Criando link simbolico /dev/ptmx -> pts/ptmx..."
