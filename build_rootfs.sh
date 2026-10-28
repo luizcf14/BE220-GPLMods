@@ -241,6 +241,11 @@ if [ -d "$CAPTIVE_SRC" ]; then
     # Salvar cópia imutável fora de /etc/config (pois o loadconfig da TP-Link no S10boot executa 'rm -rf /etc/config')
     cp -f "$CAPTIVE_SRC/etc/config/captiveportal" "$WORK_DIR/etc/captiveportal/captiveportal.default" 2>/dev/null || true
     cp -f "$CAPTIVE_SRC/etc/config/floresta_cloud" "$WORK_DIR/etc/captiveportal/floresta_cloud.default" 2>/dev/null || true
+    # Token de autenticacao do agente vem de build.local.env (AUTH_TOKEN); o fonte versionado so tem placeholder
+    if [ -n "${AUTH_TOKEN:-}" ]; then
+        echo "  [+] Aplicando AUTH_TOKEN em floresta_cloud (config + default)..."
+        sed -i "s|<AUTH_TOKEN>|$AUTH_TOKEN|g" "$WORK_DIR/etc/config/floresta_cloud" "$WORK_DIR/etc/captiveportal/floresta_cloud.default" 2>/dev/null || true
+    fi
     
     chmod 755 "$WORK_DIR/etc/init.d/captiveportal" 2>/dev/null || true
     chmod 755 "$WORK_DIR/usr/bin/portal_ctl" 2>/dev/null || true
