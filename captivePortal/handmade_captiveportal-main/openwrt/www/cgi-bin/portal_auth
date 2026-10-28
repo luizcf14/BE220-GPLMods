@@ -1,0 +1,230 @@
+#!/bin/sh
+# Portal Captivo 3000 — CGI de Autenticação
+# /www/cgi-bin/portal_auth
+#
+# Chamado pelo frontend (navegador do cliente) após login bem-sucedido no backend.
+# Recebe o Sanctum token, valida com o backend Laravel, e libera o acesso.
+#
+# SEGURANÇA:
+#   - O IP real do cliente vem de REMOTE_ADDR (TCP — impossível falsificar)
+#   - O MAC é obtido do ARP table interno do kernel (não confia no cliente)
+#   - O token é validado DIRETAMENTE contra o backend (sem segredo compartilhado)
+#
+# Uso esperado (chamada pelo frontend):
+#   POST /cgi-bin/portal_auth
+#   Body: token=60937|pn2AV...&profile=M%C3%A9dico
+#
+# Resposta JSON:
+#   {"status":"ok","profile":"Médico","session_expires":1786243685}
+#   {"status":"error","message":"Token inválido"}
+
+# ---------------------------------------------------------------------------
+# Cabeçalho CORS — necessário pois o frontend está em domínio externo
+# ---------------------------------------------------------------------------
+printf 'Content-Type: application/json\r\n'
+printf 'Access-Control-Allow-Origin: *\r\n'
+printf 'Access-Control-Allow-Methods: POST, OPTIONS\r\n'
+printf 'Access-Control-Allow-Headers: Content-Type\r\n'
+printf 'Cache-Control: no-store\r\n'
+
+# Responde preflight OPTIONS imediatamente
+if [ "$REQUEST_METHOD" = "OPTIONS" ]; then
+	printf 'Status: 204 No Content\r\n\r\n'
+	exit 0
+fi
+
+# Só aceita POST
+if [ "$REQUEST_METHOD" != "POST" ]; then
+	printf 'Status: 405 Method Not Allowed\r\n\r\n'
+	printf '{"status":"error","message":"Method not allowed"}\n'
+	exit 0
+fi
+
+printf '\r\n'
+
+# ---------------------------------------------------------------------------
+# Função: saída de erro JSON
+# ---------------------------------------------------------------------------
+error_exit() {
+	local msg="$1"
+	logger -t portal_auth "ERRO [$CLIENT_IP]: $msg"
+	printf '{"status":"error","message":"%s"}\n' "$msg"
+	exit 0
+}
+
+# ---------------------------------------------------------------------------
+# Lê configuração UCI
+# ---------------------------------------------------------------------------
+API_URL=$(uci -q get captiveportal.global.api_url 2>/dev/null || echo "https://apidev.conexaopovosdafloresta.org.br")
+API_USER_PATH=$(uci -q get captiveportal.global.api_user_path 2>/dev/null || echo "/api/user/me")
+SESSION_TIME=$(uci -q get captiveportal.global.session_time 2>/dev/null || echo "3600")
+SESSIONS_FILE="/tmp/captiveportal_sessions.json"
+
+# ---------------------------------------------------------------------------
+# Obtém o IP real do cliente (impossível de falsificar — vem do TCP)
+# ---------------------------------------------------------------------------
+CLIENT_IP="$REMOTE_ADDR"
+[ -z "$CLIENT_IP" ] && error_exit "IP do cliente não detectado"
+
+# ---------------------------------------------------------------------------
+# Obtém o MAC real do cliente via ARP table do kernel
+# (Ignora qualquer MAC que o cliente tente enviar nos parâmetros)
+# ---------------------------------------------------------------------------
+CLIENT_MAC=$(awk -v ip="$CLIENT_IP" '$1==ip{print $4}' /proc/net/arp 2>/dev/null | head -1)
+[ -z "$CLIENT_MAC" ] && CLIENT_MAC=$(arp -n "$CLIENT_IP" 2>/dev/null | awk '/ether/{print $3}' | head -1)
+[ -z "$CLIENT_MAC" ] && CLIENT_MAC="unknown"
+
+logger -t portal_auth "Requisição de autorização: IP=$CLIENT_IP MAC=$CLIENT_MAC"
+
+# ---------------------------------------------------------------------------
+# Lê o body POST (application/x-www-form-urlencoded ou application/json)
+# ---------------------------------------------------------------------------
+CONTENT_LENGTH="${CONTENT_LENGTH:-0}"
+if [ "$CONTENT_LENGTH" -gt 0 ] 2>/dev/null; then
+	POST_BODY=$(dd bs=1 count="$CONTENT_LENGTH" 2>/dev/null)
+else
+	read -r POST_BODY
+fi
+
+# Decodifica parâmetros (suporte a form-urlencoded e JSON simples)
+# Extrai token
+TOKEN=$(printf '%s' "$POST_BODY" | sed -n 's/.*[&?]*token=\([^&]*\).*/\1/p' | head -1)
+if [ -z "$TOKEN" ]; then
+	# Tenta extrair do JSON
+	TOKEN=$(printf '%s' "$POST_BODY" | sed -n 's/.*"token"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
+fi
+
+# Decodificação de URL completa (trata %7C, %2B, %2F, etc.)
+TOKEN=$(printf '%b' "$(printf '%s' "$TOKEN" | sed 's/+/ /g; s/%\([0-9a-fA-F]\{2\}\)/\\x\1/g')")
+# Clean token: remove \r, \n, spaces, quotes
+TOKEN=$(printf '%s' "$TOKEN" | tr -d '\r\n"' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+
+[ -z "$TOKEN" ] && error_exit "Token não fornecido"
+
+# ---------------------------------------------------------------------------
+# Valida o token contra o backend Laravel (GET /api/user)
+# ---------------------------------------------------------------------------
+TOKEN_PREVIEW=$(printf '%s' "$TOKEN" | cut -c 1-12)
+logger -t portal_auth "Validando token com o backend (token=${TOKEN_PREVIEW}...)..."
+
+VALIDATE_URL="${API_URL}${API_USER_PATH}"
+RESPONSE=$(uclient-fetch --no-check-certificate -O- \
+	--header "Authorization: Bearer $TOKEN" \
+	--header "Accept: application/json" \
+	--timeout 10 \
+	"$VALIDATE_URL" 2>/tmp/portal_auth_err)
+
+FETCH_CODE=$?
+ERR=$(cat /tmp/portal_auth_err 2>/dev/null)
+
+if [ $FETCH_CODE -ne 0 ]; then
+	logger -t portal_auth "Retorno do backend (code=$FETCH_CODE): $ERR"
+	HTTP_CODE=$(echo "$ERR" | sed -n 's/.*HTTP error \([0-9][0-9][0-9]\).*/\1/p' | head -1)
+	if [ -n "$HTTP_CODE" ]; then
+		if [ "$HTTP_CODE" = "401" ] || [ "$HTTP_CODE" = "403" ] || [ "$HTTP_CODE" = "422" ]; then
+			error_exit "Token inválido, expirado ou recusado pelo backend (HTTP $HTTP_CODE)"
+		else
+			error_exit "Erro no backend (HTTP $HTTP_CODE)"
+		fi
+	else
+		error_exit "Falha ao conectar com o backend (servidor inacessível)"
+	fi
+fi
+
+# Verifica se a resposta contém o usuário
+if echo "$RESPONSE" | grep -qE '"Unauthenticated"|"message".*"Unauthenticated"'; then
+	error_exit "Token inválido ou expirado"
+fi
+
+# Extrai o nome da role do JSON de resposta: user.role.name ou fallback
+ROLE_NAME=$(printf '%s' "$RESPONSE" | sed -n 's/.*"role"[^{]*{[^}]*"name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
+[ -z "$ROLE_NAME" ] && ROLE_NAME=$(printf '%s' "$RESPONSE" | sed -n 's/.*"role"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
+
+USER_EMAIL=$(printf '%s' "$RESPONSE" | sed -n 's/.*"email"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
+USER_NAME=$(printf '%s' "$RESPONSE" | sed -n 's/.*"name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
+
+# Fallback para Visitante se a role não estiver explícita
+if [ -z "$ROLE_NAME" ]; then
+	logger -t portal_auth "AVISO: role não encontrada no JSON do backend. Usando Visitante."
+	ROLE_NAME="Visitante"
+fi
+
+logger -t portal_auth "Token válido: user='$USER_NAME' email='$USER_EMAIL' role='$ROLE_NAME'"
+
+# ---------------------------------------------------------------------------
+# Busca o fwmark correspondente ao perfil retornado
+# ---------------------------------------------------------------------------
+FWMARK=""
+DL_KBIT=""
+UL_KBIT=""
+
+find_profile() {
+	local cfg="$1"
+	local pname fwmark dl ul
+	config_get pname  "$cfg" name
+	config_get fwmark "$cfg" fwmark
+	config_get dl     "$cfg" dl_kbit 0
+	config_get ul     "$cfg" ul_kbit 0
+
+	if [ "$pname" = "$ROLE_NAME" ]; then
+		FWMARK="$fwmark"
+		DL_KBIT="$dl"
+		UL_KBIT="$ul"
+	fi
+}
+
+. /lib/functions.sh
+config_load captiveportal
+config_foreach find_profile profile
+
+if [ -z "$FWMARK" ]; then
+	# Perfil não mapeado — usa Visitante (fwmark=1) como fallback
+	logger -t portal_auth "AVISO: perfil '$ROLE_NAME' não encontrado na config. Usando Visitante."
+	FWMARK=1
+	DL_KBIT=2048
+	UL_KBIT=1024
+fi
+
+# ---------------------------------------------------------------------------
+# Adiciona IP ao set nftables de autenticados com timeout de sessão
+# ---------------------------------------------------------------------------
+SESSION_EXPIRES=$(($(date +%s) + SESSION_TIME))
+
+nft add element inet fw4 captive_authenticated \
+	"{ $CLIENT_IP timeout ${SESSION_TIME}s }" 2>/dev/null || \
+	error_exit "Falha ao inserir no nftables"
+
+# Adiciona/atualiza fwmark no verdict map
+nft add element inet fw4 captive_fwmark \
+	"{ $CLIENT_IP : $FWMARK }" 2>/dev/null
+
+logger -t portal_auth "ACESSO LIBERADO: IP=$CLIENT_IP MAC=$CLIENT_MAC role='$ROLE_NAME' fwmark=$FWMARK dl=${DL_KBIT}kbps session=${SESSION_TIME}s"
+
+# ---------------------------------------------------------------------------
+# Registra sessão no arquivo de estado (para exibição no LuCI)
+# ---------------------------------------------------------------------------
+SESSION_ENTRY=$(printf '{"ip":"%s","mac":"%s","user":"%s","email":"%s","profile":"%s","fwmark":%s,"dl_kbit":%s,"ul_kbit":%s,"expires":%s,"started":%s}' \
+	"$CLIENT_IP" "$CLIENT_MAC" "$USER_NAME" "$USER_EMAIL" "$ROLE_NAME" \
+	"$FWMARK" "${DL_KBIT:-0}" "${UL_KBIT:-0}" "$SESSION_EXPIRES" "$(date +%s)")
+
+# Adiciona à lista de sessões (remove entrada antiga do mesmo IP se existir)
+if [ -f "$SESSIONS_FILE" ] && [ -s "$SESSIONS_FILE" ]; then
+	OTHER_SESSIONS=$(cat "$SESSIONS_FILE" | \
+		sed 's/{"sessions":\[//; s/\]}//' | \
+		sed "s/{\"ip\":\"$CLIENT_IP\"[^}]*},\?//g" | \
+		sed 's/^,//; s/,$//; s/,,/,/g')
+
+	if [ -n "$OTHER_SESSIONS" ]; then
+		printf '{"sessions":[%s,%s]}' "$SESSION_ENTRY" "$OTHER_SESSIONS" > "$SESSIONS_FILE"
+	else
+		printf '{"sessions":[%s]}' "$SESSION_ENTRY" > "$SESSIONS_FILE"
+	fi
+else
+	printf '{"sessions":[%s]}' "$SESSION_ENTRY" > "$SESSIONS_FILE"
+fi
+
+# ---------------------------------------------------------------------------
+# Resposta de sucesso ao frontend
+# ---------------------------------------------------------------------------
+printf '{"status":"ok","profile":"%s","session_expires":%s,"fwmark":%s}\n' \
+	"$ROLE_NAME" "$SESSION_EXPIRES" "$FWMARK"

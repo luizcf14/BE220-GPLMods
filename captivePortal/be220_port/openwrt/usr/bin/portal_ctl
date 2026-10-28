@@ -1,0 +1,250 @@
+#!/bin/sh
+# Portal Captivo 3000 — CLI de Gerenciamento (BE220 Port — iptables)
+# /usr/bin/portal_ctl
+#
+# Uso:
+#   portal_ctl status              — mostra sessões ativas e estado do serviço
+#   portal_ctl sessions            — lista sessões ativas (tabela)
+#   portal_ctl sessions-json       — lista sessões em JSON
+#   portal_ctl kick <IP>           — desconecta um cliente pelo IP
+#   portal_ctl kick-mac <MAC>      — desconecta pelo MAC
+#   portal_ctl flush               — desconecta TODOS os clientes
+#   portal_ctl whitelist           — lista domínios do walled garden
+#   portal_ctl whitelist add <d>   — adiciona domínio
+#   portal_ctl whitelist del <d>   — remove domínio
+#   portal_ctl profiles            — lista perfis de velocidade
+#   portal_ctl restart             — reinicia serviço
+
+SESSIONS_FILE="/tmp/captiveportal_sessions.json"
+
+_usage() {
+	cat << 'EOF'
+Portal Captivo 3000 — Ferramenta de Gerenciamento (BE220)
+
+Uso: portal_ctl <comando> [args]
+
+Comandos:
+  status              Estado geral: sessões ativas, iptables, uptime
+  sessions            Lista sessões ativas em formato tabela
+  sessions-json       Lista sessões em JSON
+  renew               Executa verificação de auto-renovação de sessões
+  kick <IP>           Desconecta cliente pelo IP imediatamente
+  kick-mac <MAC>      Desconecta cliente pelo endereço MAC
+  flush               Desconecta TODOS os clientes ativos
+  whitelist           Lista domínios liberados (walled garden)
+  whitelist add <d>   Adiciona domínio e recarrega
+  whitelist del <d>   Remove domínio e recarrega
+  profiles            Lista perfis de velocidade configurados
+  restart             Reinicia o serviço captiveportal
+  help                Exibe esta ajuda
+
+EOF
+}
+
+_check_root() {
+	[ "$(id -u)" = "0" ] || { echo "Erro: requer root"; exit 1; }
+}
+
+# ---------------------------------------------------------------------------
+# status
+# ---------------------------------------------------------------------------
+cmd_status() {
+	echo "=== Portal Captivo 3000 — Status (Archer BE220) ==="
+	echo ""
+	echo "Serviço:"
+	if iptables -L CAPTIVE_FORWARD -n >/dev/null 2>&1; then
+		echo "  ● Ativo (regras iptables carregadas)"
+	else
+		echo "  ○ Inativo"
+	fi
+	echo ""
+
+	AUTH_COUNT=$(iptables -L CAPTIVE_AUTH_FWD -n 2>/dev/null | grep -c 'ACCEPT' || echo 0)
+	echo "Clientes Autenticados (iptables): $AUTH_COUNT"
+	iptables -L CAPTIVE_AUTH_FWD -n 2>/dev/null | grep 'ACCEPT' | awk '{print "  IP: " $4}'
+	echo ""
+
+	echo "Walled Garden (IPs liberados no firewall):"
+	iptables -L CAPTIVE_WARDEN_FWD -n 2>/dev/null | grep 'ACCEPT' | awk '{print "  " $4}'
+	echo ""
+
+	echo "Sessões ativas no registro:"
+	cmd_sessions
+}
+
+# ---------------------------------------------------------------------------
+# sessions
+# ---------------------------------------------------------------------------
+cmd_sessions() {
+	if [ ! -f "$SESSIONS_FILE" ] || [ "$(cat "$SESSIONS_FILE")" = '{"sessions":[]}' ]; then
+		echo "  (nenhuma sessão ativa)"
+		return
+	fi
+
+	NOW=$(date +%s)
+	printf '  %-15s %-17s %-20s %-14s %s\n' "IP" "MAC" "Usuário" "Perfil" "Expira em"
+	printf '  %-15s %-17s %-20s %-14s %s\n' "---------------" "-----------------" "--------------------" "--------------" "---------"
+
+	awk -v now="$NOW" '
+	{
+		while (match($0, /\{[^{]*"ip":"([^"]+)"[^}]*"mac":"([^"]+)"[^}]*"user":"([^"]+)"[^}]*"profile":"([^"]+)"[^}]*"expires":([0-9]+)/, arr)) {
+			ip=arr[1]; mac=arr[2]; user=arr[3]; profile=arr[4]; exp=arr[5]
+			remain=exp-now
+			if (remain > 0) {
+				if (remain >= 3600) fmt=int(remain/3600)"h "int((remain%3600)/60)"m"
+				else fmt=int(remain/60)"m "int(remain%60)"s"
+				printf "  %-15s %-17s %-20s %-14s %s\n", ip, mac, substr(user,1,20), profile, fmt
+			}
+			$0 = substr($0, RSTART+RLENGTH)
+		}
+		exit
+	}' "$SESSIONS_FILE" 2>/dev/null || cat "$SESSIONS_FILE"
+}
+
+# ---------------------------------------------------------------------------
+# kick <IP>
+# ---------------------------------------------------------------------------
+cmd_kick() {
+	local ip="$1"
+	_check_root
+	[ -z "$ip" ] && { echo "Uso: portal_ctl kick <IP>"; exit 1; }
+
+	echo "Desconectando $ip..."
+
+	iptables -t nat -D CAPTIVE_AUTH_RETURN -s "$ip" -j ACCEPT 2>/dev/null && \
+		echo "  ✓ Removido do NAT bypass" || true
+	iptables -D CAPTIVE_AUTH_FWD -s "$ip" -j ACCEPT 2>/dev/null && \
+		echo "  ✓ Removido do FORWARD bypass" || true
+	iptables -t mangle -L CAPTIVE_MANGLE -n --line-numbers 2>/dev/null \
+		| awk -v ip="$ip" '$0 ~ ip {print $1}' | sort -rn \
+		| while read -r n; do
+			iptables -t mangle -D CAPTIVE_MANGLE "$n" 2>/dev/null || true
+		done
+
+	if [ -f "$SESSIONS_FILE" ]; then
+		OTHER_SESSIONS=$(cat "$SESSIONS_FILE" | sed 's/{"sessions":\[//; s/\]}//' | sed "s/{\"ip\":\"$ip\"[^}]*},\?//g" | sed 's/^,//; s/,$//; s/,,/,/g')
+		if [ -n "$OTHER_SESSIONS" ]; then
+			printf '{"sessions":[%s]}' "$OTHER_SESSIONS" > "$SESSIONS_FILE"
+		else
+			printf '{"sessions":[]}' > "$SESSIONS_FILE"
+		fi
+	fi
+
+	logger -t portal_ctl "Sessão encerrada manualmente: IP=$ip"
+	echo "  ✓ Cliente $ip desconectado."
+}
+
+# ---------------------------------------------------------------------------
+# kick-mac <MAC>
+# ---------------------------------------------------------------------------
+cmd_kick_mac() {
+	local mac="$1"
+	_check_root
+	[ -z "$mac" ] && { echo "Uso: portal_ctl kick-mac <MAC>"; exit 1; }
+
+	IP=$(grep -o '"ip":"[^"]*"[^}]*"mac":"'"$mac"'"' "$SESSIONS_FILE" 2>/dev/null | \
+		sed 's/"ip":"//;s/".*//')
+
+	if [ -n "$IP" ]; then
+		cmd_kick "$IP"
+	else
+		IP=$(arp -n 2>/dev/null | awk -v mac="$mac" 'tolower($3)==tolower(mac){print $1}')
+		[ -n "$IP" ] && cmd_kick "$IP" || echo "Erro: MAC $mac não encontrado em sessões ativas."
+	fi
+}
+
+# ---------------------------------------------------------------------------
+# flush
+# ---------------------------------------------------------------------------
+cmd_flush() {
+	_check_root
+	echo "Desconectando TODOS os clientes..."
+	iptables -t nat -F CAPTIVE_AUTH_RETURN 2>/dev/null || true
+	iptables -F CAPTIVE_AUTH_FWD 2>/dev/null || true
+	iptables -t mangle -F CAPTIVE_MANGLE 2>/dev/null || true
+	echo '{"sessions":[]}' > "$SESSIONS_FILE"
+	logger -t portal_ctl "Todas as sessões encerradas (flush)"
+	echo "  ✓ Todos os clientes desconectados."
+}
+
+# ---------------------------------------------------------------------------
+# whitelist
+# ---------------------------------------------------------------------------
+cmd_whitelist() {
+	echo "=== Walled Garden — Domínios Liberados ==="
+	uci show captiveportal.walled_garden 2>/dev/null | grep '\.domain=' | \
+		sed "s/.*domain='\(.*\)'/  \1/"
+	echo ""
+	echo "  (IP do roteador sempre liberado implicitamente)"
+}
+
+cmd_whitelist_add() {
+	local domain="$1"
+	_check_root
+	[ -z "$domain" ] && { echo "Uso: portal_ctl whitelist add <domínio>"; exit 1; }
+	uci add_list captiveportal.walled_garden.domain="$domain"
+	uci commit captiveportal
+	/etc/init.d/captiveportal restart
+	echo "  ✓ Domínio '$domain' adicionado e walled garden recarregado."
+}
+
+cmd_whitelist_del() {
+	local domain="$1"
+	_check_root
+	[ -z "$domain" ] && { echo "Uso: portal_ctl whitelist del <domínio>"; exit 1; }
+	uci del_list captiveportal.walled_garden.domain="$domain"
+	uci commit captiveportal
+	/etc/init.d/captiveportal restart
+	echo "  ✓ Domínio '$domain' removido e walled garden recarregado."
+}
+
+# ---------------------------------------------------------------------------
+# profiles
+# ---------------------------------------------------------------------------
+cmd_profiles() {
+	echo "=== Perfis de Velocidade Configurados ==="
+	printf '  %-14s %-6s %-12s %s\n' "Perfil" "Mark" "Download" "Upload"
+	printf '  %-14s %-6s %-12s %s\n' "--------------" "------" "------------" "------"
+
+	. /lib/functions.sh
+	config_load captiveportal
+
+	_print_profile() {
+		local cfg="$1"
+		local name fwmark dl ul
+		config_get name   "$cfg" name
+		config_get fwmark "$cfg" fwmark
+		config_get dl     "$cfg" dl_kbit 0
+		config_get ul     "$cfg" ul_kbit 0
+
+		[ "$dl" = "0" ] && dl_str="Ilimitado" || dl_str="${dl} kbps"
+		[ "$ul" = "0" ] && ul_str="Ilimitado" || ul_str="${ul} kbps"
+
+		printf '  %-14s %-6s %-12s %s\n' "$name" "0x$fwmark" "$dl_str" "$ul_str"
+	}
+	config_foreach _print_profile profile
+}
+
+# ---------------------------------------------------------------------------
+# Dispatcher
+# ---------------------------------------------------------------------------
+case "$1" in
+	status)          cmd_status ;;
+	renew)           /etc/captiveportal/renew-sessions.sh ;;
+	sessions)        cmd_sessions ;;
+	sessions-json)   [ -f "$SESSIONS_FILE" ] && cat "$SESSIONS_FILE" || echo '{"sessions":[]}' ;;
+	restart|reload)  /etc/init.d/captiveportal restart ;;
+	kick)            cmd_kick "$2" ;;
+	kick-mac)        cmd_kick_mac "$2" ;;
+	flush)           cmd_flush ;;
+	whitelist)
+		case "$2" in
+			add) cmd_whitelist_add "$3" ;;
+			del) cmd_whitelist_del "$3" ;;
+			*)   cmd_whitelist ;;
+		esac
+		;;
+	profiles)        cmd_profiles ;;
+	help|--help|-h)  _usage ;;
+	*)               _usage; exit 1 ;;
+esac

@@ -1,0 +1,132 @@
+#!/bin/sh
+# ============================================================================
+# Conexão Povos da Floresta — Utilitário de Adoção de Frota (Estilo UniFi)
+# Uso: set-inform <URL_DO_CONTROLLER>
+# Exemplo: set-inform http://192.168.0.2:8088/ws/router
+#          set-inform https://painel.conexaopovosdafloresta.org.br/ws/router
+# ============================================================================
+
+export PATH=/sbin:/bin:/usr/sbin:/usr/bin:$PATH
+
+# Restaura configuração persistente de /data ou /user_data1 sobre o ramfs /etc/config se existir
+if [ -s /data/etc/config/floresta_cloud ]; then
+	cp -f /data/etc/config/floresta_cloud /etc/config/floresta_cloud 2>/dev/null || true
+elif [ -s /user_data1/etc/config/floresta_cloud ]; then
+	cp -f /user_data1/etc/config/floresta_cloud /etc/config/floresta_cloud 2>/dev/null || true
+elif [ ! -f /etc/config/floresta_cloud ]; then
+	touch /etc/config/floresta_cloud 2>/dev/null || true
+fi
+
+if ! /sbin/uci -q get floresta_cloud.global >/dev/null 2>&1; then
+	/sbin/uci set floresta_cloud.global='floresta_cloud'
+fi
+
+URL="$1"
+
+if [ -z "$URL" ]; then
+	echo "Uso: set-inform <URL_DO_CONTROLLER>"
+	echo "Exemplo:"
+	echo "  set-inform http://192.168.0.2:8088/ws/router"
+	echo "  set-inform https://<CONTROLLER_HOST>/ws/router"
+	echo ""
+	echo "Status Atual:"
+	HOST=$(/sbin/uci -q get floresta_cloud.global.server_host 2>/dev/null || echo "<CONTROLLER_HOST>")
+	PORT=$(/sbin/uci -q get floresta_cloud.global.server_port 2>/dev/null || echo "443")
+	NAME=$(/sbin/uci -q get floresta_cloud.global.device_name 2>/dev/null || echo "Archer BE220")
+	echo "  Host: $HOST:$PORT"
+	echo "  Nome: $NAME"
+	exit 1
+fi
+
+# Se não começar com protocolo, verifica se parece ser SSL
+HAD_PROTO=1
+if ! echo "$URL" | grep -q '://'; then
+	HAD_PROTO=0
+	URL="http://${URL}"
+fi
+
+# Extrair protocolo, host, porta e path da URL
+ORIG_PROTO=$(echo "$URL" | grep :// | sed -e's,^\(.*\)://.*,\1,g')
+URL_NO_PROTO=$(echo "$URL" | sed -e 's,^.*://,,g')
+HOST_PORT=$(echo "$URL_NO_PROTO" | cut -d/ -f1)
+if echo "$URL_NO_PROTO" | grep -q '/'; then
+	PATH_URL="/$(echo "$URL_NO_PROTO" | cut -d/ -f2-)"
+else
+	PATH_URL="/ws/router"
+fi
+[ "$PATH_URL" = "/" ] && PATH_URL="/ws/router"
+
+HOST=$(echo "$HOST_PORT" | cut -d: -f1)
+PORT=$(echo "$HOST_PORT" | grep : | cut -d: -f2)
+
+# Se o usuário não digitou protocolo, deduz por host ou porta
+if [ "$HAD_PROTO" = "0" ]; then
+	if echo "$HOST" | grep -qE '\.run\.app' || [ "$PORT" = "443" ]; then
+		ORIG_PROTO="https"
+	else
+		ORIG_PROTO="http"
+	fi
+fi
+
+USE_SSL="0"
+if [ "$ORIG_PROTO" = "https" ] || [ "$ORIG_PROTO" = "wss" ] || echo "$HOST" | grep -qE '\.run\.app' || [ "$PORT" = "443" ]; then
+	USE_SSL="1"
+	[ -z "$PORT" ] && PORT="443"
+	# NUNCA force wss://. O protocolo de URL externa é sempre https://
+	PROTO="https"
+	URL="${PROTO}://${HOST}:${PORT}${PATH_URL}"
+	[ "$PORT" = "443" ] && URL="${PROTO}://${HOST}${PATH_URL}"
+else
+	[ -z "$PORT" ] && PORT="80"
+	# Preserva o protocolo original se o usuário especificou http ou ws
+	case "$ORIG_PROTO" in
+		http|ws) PROTO="$ORIG_PROTO" ;;
+		*) PROTO="http" ;;
+	esac
+	URL="${PROTO}://${HOST}:${PORT}${PATH_URL}"
+	[ "$PORT" = "80" ] && URL="${PROTO}://${HOST}${PATH_URL}"
+fi
+
+echo "========================================================"
+echo "  Configurando Cloud Controller da Floresta...          "
+echo "========================================================"
+echo "  URL Completa : $URL"
+echo "  Servidor     : $HOST"
+echo "  Porta        : $PORT"
+echo "  Caminho (WS) : $PATH_URL"
+echo "  SSL Seguro   : $( [ "$USE_SSL" = "1" ] && echo "Sim (HTTPS/WSS)" || echo "Não (HTTP/WS)" )"
+echo "--------------------------------------------------------"
+
+# Gravar no UCI
+/sbin/uci set floresta_cloud.global.enabled='1'
+/sbin/uci set floresta_cloud.global.server_url="$URL"
+/sbin/uci set floresta_cloud.global.server_host="$HOST"
+/sbin/uci set floresta_cloud.global.server_port="$PORT"
+/sbin/uci set floresta_cloud.global.server_path="$PATH_URL"
+/sbin/uci set floresta_cloud.global.use_ssl="$USE_SSL"
+/sbin/uci commit floresta_cloud
+
+# Persistir na NAND Flash permanente
+mkdir -p /data/etc/config /user_data1/etc/config 2>/dev/null || true
+cp -f /etc/config/floresta_cloud /data/etc/config/ 2>/dev/null || true
+cp -f /etc/config/floresta_cloud /user_data1/etc/config/ 2>/dev/null || true
+sync 2>/dev/null || true
+
+# Reiniciar o agente para conectar imediatamente
+if [ -x /etc/init.d/floresta_agent ]; then
+	/etc/init.d/floresta_agent restart >/dev/null 2>&1 &
+else
+	killall -9 lua floresta_agent.lua 2>/dev/null || true
+	sleep 1
+	if [ -f /data/floresta_agent.lua ]; then
+		/usr/bin/lua /data/floresta_agent.lua >/dev/null 2>&1 &
+	elif [ -f /usr/bin/floresta_agent.lua ]; then
+		/usr/bin/lua /usr/bin/floresta_agent.lua >/dev/null 2>&1 &
+	fi
+fi
+
+
+echo "[OK] Configuracao gravada com sucesso!"
+echo "[+] Conectando ao Cloud Controller..."
+echo "[i] Acesse o painel na nuvem para ACEITAR/ADOTAR este roteador!"
+echo "========================================================"

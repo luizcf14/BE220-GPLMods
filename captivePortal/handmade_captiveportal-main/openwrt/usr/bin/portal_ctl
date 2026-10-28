@@ -1,0 +1,351 @@
+#!/bin/sh
+# Portal Captivo 3000 — CLI de gerenciamento
+# /usr/bin/portal_ctl
+#
+# Uso:
+#   portal_ctl status              — mostra sessões ativas e estado do serviço
+#   portal_ctl sessions            — lista sessões ativas (JSON)
+#   portal_ctl kick <IP>           — desconecta um cliente pelo IP
+#   portal_ctl kick-mac <MAC>      — desconecta um cliente pelo MAC
+#   portal_ctl flush               — desconecta TODOS os clientes
+#   portal_ctl whitelist           — lista domínios do walled garden
+#   portal_ctl whitelist add <d>   — adiciona domínio ao walled garden
+#   portal_ctl whitelist del <d>   — remove domínio do walled garden
+#   portal_ctl profiles            — lista perfis de velocidade configurados
+
+SESSIONS_FILE="/tmp/captiveportal_sessions.json"
+
+_usage() {
+	cat << EOF
+Portal Captivo 3000 — Ferramenta de Gerenciamento
+
+Uso: portal_ctl <comando> [args]
+
+Comandos:
+  renew               Executa verificação de auto-renovação de sessões ativas
+  status              Estado geral: sessões ativas, uptime, sets nftables
+  sessions            Lista sessões ativas em formato tabela
+  sessions-json       Lista sessões em JSON bruto
+  kick <IP>           Desconecta cliente pelo IP imediatamente
+  kick-mac <MAC>      Desconecta cliente pelo endereço MAC
+  flush               Desconecta TODOS os clientes ativos
+  whitelist           Lista domínios liberados (walled garden)
+  whitelist add <d>   Adiciona domínio e recarrega
+  whitelist del <d>   Remove domínio e recarrega
+  profiles            Lista perfis de velocidade configurados
+  help                Exibe esta ajuda
+
+EOF
+}
+
+_check_root() {
+	[ "$(id -u)" = "0" ] || { echo "Erro: requer root (use sudo ou su)"; exit 1; }
+}
+
+# ---------------------------------------------------------------------------
+# status
+# ---------------------------------------------------------------------------
+cmd_status() {
+	echo "=== Portal Captivo 3000 — Status ==="
+	echo ""
+	echo "Serviço:"
+	if /etc/init.d/captiveportal status > /dev/null 2>&1; then
+		echo "  ● Ativo (rodando)"
+	else
+		echo "  ○ Inativo"
+	fi
+	echo ""
+	echo "ZeroTier (Gerenciamento Remoto):"
+	if command -v zerotier-cli > /dev/null 2>&1; then
+		ZT_INFO=$(zerotier-cli status 2>/dev/null)
+		ZT_NETS=$(zerotier-cli listnetworks 2>/dev/null | grep -v '200 listnetworks')
+		echo "  Status: ${ZT_INFO:-Conectado}"
+		[ -n "$ZT_NETS" ] && echo "  Redes:  $ZT_NETS"
+	else
+		echo "  ○ ZeroTier não instalado"
+	fi
+	echo ""
+	echo "Sets nftables:"
+	echo "  Autenticados: $(nft list set inet fw4 captive_authenticated 2>/dev/null | grep -c 'elements' || echo 0) IPs"
+	nft list set inet fw4 captive_authenticated 2>/dev/null | grep 'elements' | \
+		sed 's/.*elements = {/  IPs: /' | sed 's/}//'
+	echo ""
+	echo "  Walled Garden: $(nft list set inet fw4 captive_whitelist 2>/dev/null | \
+		awk '/elements/{p=1} p' | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | wc -l) IPs resolvidos"
+	echo ""
+	echo "Sessões ativas:"
+	cmd_sessions
+}
+
+# ---------------------------------------------------------------------------
+# sessions
+# ---------------------------------------------------------------------------
+cmd_sessions() {
+	if [ ! -f "$SESSIONS_FILE" ] || [ "$(cat "$SESSIONS_FILE")" = '{"sessions":[]}' ]; then
+		echo "  (nenhuma sessão ativa)"
+		return
+	fi
+
+	NOW=$(date +%s)
+	printf '  %-15s %-17s %-20s %-14s %s\n' "IP" "MAC" "Usuário" "Perfil" "Expira em"
+	printf '  %-15s %-17s %-20s %-14s %s\n' "---------------" "-----------------" "--------------------" "--------------" "---------"
+
+	# Parse JSON simples com awk
+	awk -v now="$NOW" '
+	{
+		while (match($0, /\{[^{]*"ip":"([^"]+)"[^}]*"mac":"([^"]+)"[^}]*"user":"([^"]+)"[^}]*"profile":"([^"]+)"[^}]*"expires":([0-9]+)/, arr)) {
+			ip=arr[1]; mac=arr[2]; user=arr[3]; profile=arr[4]; exp=arr[5]
+			remain=exp-now
+			if (remain > 0) {
+				if (remain >= 3600) fmt=int(remain/3600)"h"int((remain%3600)/60)"m"
+				else fmt=int(remain/60)"m"int(remain%60)"s"
+				printf "  %-15s %-17s %-20s %-14s %s\n", ip, mac, substr(user,1,20), profile, fmt
+			}
+			$0 = substr($0, RSTART+RLENGTH)
+		}
+		exit
+	}' "$SESSIONS_FILE" 2>/dev/null || cat "$SESSIONS_FILE"
+}
+
+# ---------------------------------------------------------------------------
+# kick <IP>
+# ---------------------------------------------------------------------------
+cmd_kick() {
+	local ip="$1"
+	_check_root
+	[ -z "$ip" ] && { echo "Uso: portal_ctl kick <IP>"; exit 1; }
+
+	echo "Desconectando $ip..."
+
+	# Remove do set de autenticados
+	nft delete element inet fw4 captive_authenticated "{ $ip }" 2>/dev/null && \
+		echo "  ✓ Removido do nftables captive_authenticated" || \
+		echo "  ! IP não estava na lista de autenticados"
+
+	# Remove do verdict map
+	nft delete element inet fw4 captive_fwmark "{ $ip }" 2>/dev/null
+
+	# Remove do arquivo de sessões
+	if [ -f "$SESSIONS_FILE" ]; then
+		OTHER_SESSIONS=$(cat "$SESSIONS_FILE" | sed 's/{"sessions":\[//; s/\]}//' | sed "s/{\"ip\":\"$ip\"[^}]*},\?//g" | sed 's/^,//; s/,$//; s/,,/,/g')
+		if [ -n "$OTHER_SESSIONS" ]; then
+			printf '{"sessions":[%s]}' "$OTHER_SESSIONS" > "$SESSIONS_FILE"
+		else
+			printf '{"sessions":[]}' > "$SESSIONS_FILE"
+		fi
+	fi
+
+	logger -t portal_ctl "Sessão encerrada manualmente: IP=$ip"
+	echo "  ✓ Sessão encerrada."
+}
+
+# ---------------------------------------------------------------------------
+# kick-mac <MAC>
+# ---------------------------------------------------------------------------
+cmd_kick_mac() {
+	local mac="$1"
+	_check_root
+	[ -z "$mac" ] && { echo "Uso: portal_ctl kick-mac <MAC>"; exit 1; }
+
+	# Encontra IP pelo MAC no arquivo de sessões
+	IP=$(grep -o '"ip":"[^"]*"[^}]*"mac":"'"$mac"'"' "$SESSIONS_FILE" 2>/dev/null | \
+		sed 's/"ip":"//;s/".*//')
+
+	if [ -n "$IP" ]; then
+		cmd_kick "$IP"
+	else
+		# Tenta via arp
+		IP=$(arp -n 2>/dev/null | awk -v mac="$mac" 'tolower($3)==tolower(mac){print $1}')
+		[ -n "$IP" ] && cmd_kick "$IP" || echo "Erro: MAC $mac não encontrado em sessões ativas."
+	fi
+}
+
+# ---------------------------------------------------------------------------
+# flush
+# ---------------------------------------------------------------------------
+cmd_flush() {
+	_check_root
+	echo "Desconectando TODOS os clientes..."
+	nft flush set inet fw4 captive_authenticated 2>/dev/null
+	nft flush map inet fw4 captive_fwmark 2>/dev/null
+	echo '{"sessions":[]}' > "$SESSIONS_FILE"
+	logger -t portal_ctl "Todas as sessões encerradas (flush)"
+	echo "  ✓ Todos os clientes desconectados."
+}
+
+# ---------------------------------------------------------------------------
+# whitelist
+# ---------------------------------------------------------------------------
+cmd_whitelist() {
+	echo "=== Walled Garden — Domínios Liberados ==="
+	uci show captiveportal.walled_garden 2>/dev/null | grep '\.domain=' | \
+		sed "s/.*domain='\(.*\)'/  \1/"
+	echo ""
+	echo "  (192.168.1.1 sempre liberado implicitamente)"
+}
+
+cmd_whitelist_add() {
+	local domain="$1"
+	_check_root
+	[ -z "$domain" ] && { echo "Uso: portal_ctl whitelist add <domínio>"; exit 1; }
+	uci add_list captiveportal.walled_garden.domain="$domain"
+	uci commit captiveportal
+	service captiveportal reload
+	echo "  ✓ Domínio '$domain' adicionado e walled garden recarregado."
+}
+
+cmd_whitelist_del() {
+	local domain="$1"
+	_check_root
+	[ -z "$domain" ] && { echo "Uso: portal_ctl whitelist del <domínio>"; exit 1; }
+	uci del_list captiveportal.walled_garden.domain="$domain"
+	uci commit captiveportal
+	service captiveportal reload
+	echo "  ✓ Domínio '$domain' removido e walled garden recarregado."
+}
+
+# ---------------------------------------------------------------------------
+# profiles
+# ---------------------------------------------------------------------------
+cmd_profiles() {
+	echo "=== Perfis de Velocidade Configurados ==="
+	printf '  %-14s %-6s %-12s %s\n' "Perfil (role)" "Mark" "Download" "Upload"
+	printf '  %-14s %-6s %-12s %s\n' "--------------" "------" "------------" "------"
+
+	. /lib/functions.sh
+	config_load captiveportal
+
+	_print_profile() {
+		local cfg="$1"
+		local name fwmark dl ul
+		config_get name   "$cfg" name
+		config_get fwmark "$cfg" fwmark
+		config_get dl     "$cfg" dl_kbit 0
+		config_get ul     "$cfg" ul_kbit 0
+
+		[ "$dl" = "0" ] && dl_str="Ilimitado" || dl_str="${dl} kbps"
+		[ "$ul" = "0" ] && ul_str="Ilimitado" || ul_str="${ul} kbps"
+
+		printf '  %-14s %-6s %-12s %s\n' "$name" "0x$fwmark" "$dl_str" "$ul_str"
+	}
+	config_foreach _print_profile profile
+}
+
+cmd_qos_status() {
+	local wan_if qos_enabled dropped overlimits alert
+	wan_if=$(uci -q get captiveportal.global.wan_interface 2>/dev/null || echo "eth0.2")
+	qos_enabled=$(uci -q get captiveportal.global.enable_qos 2>/dev/null || echo "1")
+
+	dropped=0
+	overlimits=0
+	if command -v tc >/dev/null 2>&1; then
+		dropped=$(tc -s qdisc show dev "$wan_if" 2>/dev/null | awk '/dropped/{sum+=$7} END{print sum+0}')
+		overlimits=$(tc -s qdisc show dev "$wan_if" 2>/dev/null | awk '/overlimits/{sum+=$9} END{print sum+0}')
+	fi
+
+	alert="false"
+	[ "${dropped:-0}" -gt 0 ] && alert="true"
+
+	printf '{"qos_enabled":%s,"dropped":%s,"overlimits":%s,"alert":%s}\n' \
+		"$([ "$qos_enabled" = "1" ] && echo "true" || echo "false")" \
+		"${dropped:-0}" "${overlimits:-0}" "$alert"
+}
+
+cmd_blacklist() {
+	echo "=== Blacklist DNS — Domínios Bloqueados ==="
+	echo ""
+	local enabled
+	enabled=$(uci -q get captiveportal.blacklist.enabled 2>/dev/null || echo "1")
+	if [ "$enabled" = "0" ]; then
+		echo "  Status: DESABILITADO"
+	else
+		echo "  Status: ATIVO (redirecionando para página de bloqueio)"
+	fi
+	echo ""
+	echo "Domínios Manuais:"
+	uci show captiveportal.blacklist 2>/dev/null | grep '\.domain=' | \
+		sed "s/.*domain='\(.*\)'/  - \1/"
+	echo ""
+	if [ -f /tmp/community-blacklist.txt ]; then
+		local count
+		count=$(wc -l < /tmp/community-blacklist.txt 2>/dev/null || echo 0)
+		echo "Lista da Comunidade: $count domínios carregados na RAM (/tmp/community-blacklist.txt)"
+	else
+		echo "Lista da Comunidade: Nenhuma lista baixada ainda (use: portal_ctl blacklist update-community)"
+	fi
+}
+
+cmd_blacklist_add() {
+	local domain="$1"
+	_check_root
+	[ -z "$domain" ] && { echo "Uso: portal_ctl blacklist add <domínio>"; exit 1; }
+	uci add_list captiveportal.blacklist.domain="$domain"
+	uci commit captiveportal
+	/etc/init.d/captiveportal restart
+	echo "  ✓ Domínio '$domain' adicionado à blacklist DNS."
+}
+
+cmd_blacklist_del() {
+	local domain="$1"
+	_check_root
+	[ -z "$domain" ] && { echo "Uso: portal_ctl blacklist del <domínio>"; exit 1; }
+	uci del_list captiveportal.blacklist.domain="$domain"
+	uci commit captiveportal
+	/etc/init.d/captiveportal restart
+	echo "  ✓ Domínio '$domain' removido da blacklist DNS."
+}
+
+cmd_blacklist_update_community() {
+	_check_root
+	local url
+	url=$(uci -q get captiveportal.blacklist.community_url 2>/dev/null || echo "https://raw.githubusercontent.com/StevenBlack/hosts/master/alternates/porn/hosts")
+	echo "Baixando lista de bloqueio da comunidade de:"
+	echo "  $url"
+
+	uclient-fetch --no-check-certificate -q -O /tmp/community_hosts.tmp "$url"
+	if [ $? -eq 0 ] && [ -s /tmp/community_hosts.tmp ]; then
+		awk '/^0\.0\.0\.0/ { if ($2 != "0.0.0.0" && $2 ~ /^[a-zA-Z0-9.-]+$/) print $2 }' /tmp/community_hosts.tmp | sort -u > /tmp/community-blacklist.txt
+		local count
+		count=$(wc -l < /tmp/community-blacklist.txt 2>/dev/null || echo 0)
+		echo "  ✓ Sucesso! $count domínios salvos na memória RAM (/tmp/community-blacklist.txt)."
+		rm -f /tmp/community_hosts.tmp
+		/etc/init.d/captiveportal restart
+	else
+		echo "  ✕ Erro ao baixar a lista da comunidade."
+		rm -f /tmp/community_hosts.tmp
+		exit 1
+	fi
+}
+
+# ---------------------------------------------------------------------------
+# Dispatcher
+# ---------------------------------------------------------------------------
+case "$1" in
+	status)          cmd_status ;;
+	renew)           /etc/captiveportal/renew-sessions.sh ;;
+	sessions)        cmd_sessions ;;
+	sessions-json)   [ -f "$SESSIONS_FILE" ] && cat "$SESSIONS_FILE" || echo '{"sessions":[]}' ;;
+	qos-status)      cmd_qos_status ;;
+	restart|reload)  /etc/init.d/captiveportal restart ;;
+	kick)            cmd_kick "$2" ;;
+	kick-mac)        cmd_kick_mac "$2" ;;
+	flush)           cmd_flush ;;
+	whitelist)
+		case "$2" in
+			add) cmd_whitelist_add "$3" ;;
+			del) cmd_whitelist_del "$3" ;;
+			*)   cmd_whitelist ;;
+		esac
+		;;
+	blacklist)
+		case "$2" in
+			add)              cmd_blacklist_add "$3" ;;
+			del)              cmd_blacklist_del "$3" ;;
+			update-community) cmd_blacklist_update_community ;;
+			*)                cmd_blacklist ;;
+		esac
+		;;
+	profiles)        cmd_profiles ;;
+	help|--help|-h)  _usage ;;
+	*)               _usage; exit 1 ;;
+esac

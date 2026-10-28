@@ -1,0 +1,588 @@
+#!/bin/sh
+# Portal Captivo 3000 — Admin API (BE220 Port)
+# /www/cgi-bin/captive_admin_api
+#
+# API JSON para o painel de administração do portal captivo.
+# Acessível apenas da LAN (uhttpd rfc1918_filter ou verificação de IP).
+#
+# Endpoints:
+#   GET  ?action=status      → sessões ativas, estado do serviço, stats
+#   GET  ?action=whitelist   → domínios do walled garden
+#   GET  ?action=profiles    → perfis de velocidade configurados
+#   POST action=kick&ip=X    → desconecta cliente pelo IP
+#   POST action=kick_mac&mac=X → desconecta pelo MAC
+#   POST action=flush        → desconecta TODOS
+#   POST action=whitelist_add&domain=X → adiciona domínio
+#   POST action=whitelist_del&domain=X → remove domínio
+#   POST action=service_restart         → reinicia o serviço
+
+export PATH=/sbin:/bin:/usr/sbin:/usr/bin:$PATH
+
+SESSIONS_FILE="/tmp/captiveportal_sessions.json"
+
+# ---------------------------------------------------------------------------
+# CORS / Cabeçalhos
+# ---------------------------------------------------------------------------
+printf 'Content-Type: application/json\r\n'
+printf 'Access-Control-Allow-Origin: *\r\n'
+printf 'Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n'
+printf 'Access-Control-Allow-Headers: Content-Type\r\n'
+printf 'Cache-Control: no-store\r\n'
+
+if [ "$REQUEST_METHOD" = "OPTIONS" ]; then
+	printf 'Status: 204 No Content\r\n\r\n'
+	exit 0
+fi
+
+printf '\r\n'
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+json_error() { printf '{"ok":false,"error":"%s"}\n' "$1"; exit 0; }
+json_ok()    { printf '{"ok":true%s}\n' "${1:+,$1}"; exit 0; }
+
+# Lê body POST apenas se for POST
+_read_post() {
+	if [ "$REQUEST_METHOD" = "POST" ]; then
+		CONTENT_LENGTH="${CONTENT_LENGTH:-0}"
+		if [ "$CONTENT_LENGTH" -gt 0 ] 2>/dev/null; then
+			POST_BODY=$(dd bs=1 count="$CONTENT_LENGTH" 2>/dev/null)
+		fi
+	fi
+}
+
+# Extrai parâmetro de query string ou POST body (com decodificação de URL)
+_param() {
+	local key="$1"
+	local val
+	val=$(printf '%s&%s' "${QUERY_STRING}" "${POST_BODY}" | tr '&' '\n' \
+		| grep "^${key}=" | head -1 | sed "s/^${key}=//")
+	[ -z "$val" ] && return
+	printf '%b' "$(printf '%s' "$val" | sed 's/+/ /g; s/%\([0-9a-fA-F]\{2\}\)/\\x\1/g')" 2>/dev/null || \
+	printf '%s' "$val" | sed 's/+/ /g; s/%2[fF]/\//g; s/%3[aA]/:/g; s/%20/ /g; s/%2[eE]/./g; s/%3[fF]/?/g; s/%3[dD]/=/g'
+}
+
+# Verifica se cadeia iptables existe
+_chain_exists() {
+	iptables -L "$1" -n >/dev/null 2>&1
+}
+
+# Remove cliente autenticado do iptables
+_ipt_kick_ip() {
+	local ip="$1"
+	[ -z "$ip" ] && return 1
+	iptables -t nat -D CAPTIVE_AUTH_RETURN -s "$ip" -j ACCEPT 2>/dev/null || true
+	iptables        -D CAPTIVE_AUTH_FWD    -s "$ip" -j ACCEPT 2>/dev/null || true
+	iptables -t mangle -D CAPTIVE_MANGLE_PRE  -s "$ip" -j BLOGSKIP 2>/dev/null || true
+	iptables -t mangle -D CAPTIVE_MANGLE_PRE  -d "$ip" -j BLOGSKIP 2>/dev/null || true
+	for m in 1 2 3 4; do
+		iptables -t mangle -D CAPTIVE_MANGLE_POST -s "$ip" -j MARK --set-mark "$m" 2>/dev/null || true
+		iptables -t mangle -D CAPTIVE_MANGLE_POST -d "$ip" -j MARK --set-mark "$m" 2>/dev/null || true
+		iptables -t mangle -D CAPTIVE_MANGLE -s "$ip" -j MARK --set-mark "$m" 2>/dev/null || true
+		iptables -t mangle -D CAPTIVE_MANGLE -d "$ip" -j MARK --set-mark "$m" 2>/dev/null || true
+	done
+	/sbin/fc flush 2>/dev/null || true
+}
+
+# Salva configuração na partição persistente UBIFS NAND (/data e /user_data1)
+_persist_config() {
+	mkdir -p /data/captiveportal /user_data1/captiveportal 2>/dev/null || true
+	cp -f /etc/config/captiveportal /data/captiveportal/captiveportal 2>/dev/null || true
+	cp -f /etc/config/captiveportal /user_data1/captiveportal/captiveportal 2>/dev/null || true
+	sync 2>/dev/null || true
+}
+
+# Garante que /etc/config/captiveportal exista e contenha os perfis de QoS
+# (No primeiro boot de um roteador novo, o loadconfig da TP-Link executa rm -rf /etc/config)
+_ensure_config() {
+	if [ ! -s /etc/config/captiveportal ] || ! grep -q "config profile" /etc/config/captiveportal 2>/dev/null; then
+		if [ -s /data/captiveportal/captiveportal ] && grep -q "config profile" /data/captiveportal/captiveportal 2>/dev/null; then
+			cp -f /data/captiveportal/captiveportal /etc/config/captiveportal 2>/dev/null || true
+		elif [ -s /user_data1/captiveportal/captiveportal ] && grep -q "config profile" /user_data1/captiveportal/captiveportal 2>/dev/null; then
+			cp -f /user_data1/captiveportal/captiveportal /etc/config/captiveportal 2>/dev/null || true
+		elif [ -s /etc/captiveportal/captiveportal.default ]; then
+			cp -f /etc/captiveportal/captiveportal.default /etc/config/captiveportal 2>/dev/null || true
+			_persist_config
+		elif [ -s /rom/etc/config/captiveportal ]; then
+			cp -f /rom/etc/config/captiveportal /etc/config/captiveportal 2>/dev/null || true
+			_persist_config
+		else
+			cat << 'EOF' > /etc/config/captiveportal
+config captiveportal 'global'
+	option enable_qos     '1'
+	option wan_speed      '800mbit'
+	option api_url        'https://apidev.conexaopovosdafloresta.org.br'
+	option api_user_path  '/api/user/me'
+	option session_time   '3600'
+	option wan_interface  'eth0'
+	option lan_interface  'br-lan'
+	option router_ip      '192.168.12.1'
+	option router_domain  'roteador.conexaopovosdafloresta.org.br'
+	option portal_port    '2080'
+
+config captiveportal 'walled_garden'
+	list domain '192.168.12.1'
+	list domain '192.168.0.1'
+	list domain 'tplinkwifi.net'
+	list domain 'tplinklogin.net'
+	list domain 'apidev.conexaopovosdafloresta.org.br'
+	list domain 'conexaopovosdafloresta.org.br'
+	list domain 'paineldecontrole-dev.conexaopovosdafloresta.org.br'
+	list domain 'roteador.conexaopovosdafloresta.org.br'
+	list domain '*.conexaopovosdafloresta.org.br'
+
+config captiveportal 'blacklist'
+	option enabled        '1'
+	option community_url  'https://raw.githubusercontent.com/StevenBlack/hosts/master/alternates/porn/hosts'
+	list domain 'siteindesejado.com'
+
+config profile 'visitante'
+	option name     'Visitante'
+	option fwmark   '1'
+	option dl_kbit  '2048'
+	option ul_kbit  '1024'
+
+config profile 'basico'
+	option name     'Básico'
+	option fwmark   '2'
+	option dl_kbit  '5120'
+	option ul_kbit  '2048'
+
+config profile 'premium'
+	option name     'Premium'
+	option fwmark   '3'
+	option dl_kbit  '20480'
+	option ul_kbit  '10240'
+
+config profile 'ilimitado'
+	option name     'Ilimitado'
+	option fwmark   '4'
+	option dl_kbit  '0'
+	option ul_kbit  '0'
+EOF
+			_persist_config
+		fi
+	fi
+}
+
+# ---------------------------------------------------------------------------
+# Parse da ação
+# ---------------------------------------------------------------------------
+_ensure_config
+_read_post
+
+ACTION=$(_param action)
+[ -z "$ACTION" ] && json_error "action parameter required"
+
+# ---------------------------------------------------------------------------
+# GET: status
+# ---------------------------------------------------------------------------
+if [ "$ACTION" = "status" ]; then
+	NOW=$(date +%s)
+
+	# Estado do serviço
+	SERVICE_UP=false
+	if _chain_exists CAPTIVE_FORWARD; then
+		SERVICE_UP=true
+	fi
+
+	# Número de clientes autenticados via iptables
+	AUTH_COUNT=0
+	if _chain_exists CAPTIVE_AUTH_FWD; then
+		AUTH_COUNT=$(iptables -L CAPTIVE_AUTH_FWD -n 2>/dev/null | grep -c 'ACCEPT')
+		AUTH_COUNT=$(echo "$AUTH_COUNT" | tr -cd '0-9')
+		[ -z "$AUTH_COUNT" ] && AUTH_COUNT=0
+	fi
+
+	# Lê sessões do arquivo JSON
+	SESSIONS_JSON="[]"
+	if [ -f "$SESSIONS_FILE" ] && [ -s "$SESSIONS_FILE" ]; then
+		SESSIONS_JSON=$(sed -n 's/^{"sessions":\(\[.*\]\)}/\1/p' "$SESSIONS_FILE" 2>/dev/null)
+		[ -z "$SESSIONS_JSON" ] && SESSIONS_JSON="[]"
+	fi
+
+	# Uptime do serviço
+	UPTIME_STR="Ativo"
+	REF_FILE="/var/run/captive_redirector.pid"
+	[ ! -f "$REF_FILE" ] && REF_FILE="$SESSIONS_FILE"
+	if [ -f "$REF_FILE" ]; then
+		FILE_AGE=$(date +%s -r "$REF_FILE" 2>/dev/null || echo "$NOW")
+		UPTIME_S=$((NOW - FILE_AGE))
+		[ "$UPTIME_S" -lt 0 ] && UPTIME_S=0
+		H=$((UPTIME_S / 3600))
+		M=$(((UPTIME_S % 3600) / 60))
+		UPTIME_STR="${H}h ${M}m"
+	else
+		UPTIME_S=$(awk '{print int($1)}' /proc/uptime 2>/dev/null || echo 0)
+		H=$((UPTIME_S / 3600))
+		M=$(((UPTIME_S % 3600) / 60))
+		UPTIME_STR="${H}h ${M}m"
+	fi
+
+	# Configuração atual
+	ROUTER_IP=$(ip -4 addr show br-lan 2>/dev/null | awk '/inet / {print $2}' | cut -d/ -f1 | head -n1)
+	[ -z "$ROUTER_IP" ] && ROUTER_IP=$(uci -q get network.lan.ipaddr 2>/dev/null)
+	[ -z "$ROUTER_IP" ] && ROUTER_IP=$(uci -q get captiveportal.global.router_ip 2>/dev/null || echo "192.168.0.1")
+	ROUTER_IP=$(echo "$ROUTER_IP" | tr -d '\r\n')
+	SESSION_TIME=$(uci -q get captiveportal.global.session_time 2>/dev/null || echo "3600")
+	SESSION_TIME=$(echo "$SESSION_TIME" | tr -cd '0-9')
+	LAN_IF=$(uci -q get captiveportal.global.lan_interface 2>/dev/null || echo "br-lan")
+	LAN_IF=$(echo "$LAN_IF" | tr -d '\r\n')
+	WAN_IF=$(uci -q get captiveportal.global.wan_interface 2>/dev/null || echo "eth0")
+	WAN_IF=$(echo "$WAN_IF" | tr -d '\r\n')
+	QOS=$(uci -q get captiveportal.global.enable_qos 2>/dev/null || echo "1")
+	QOS=$(echo "$QOS" | tr -d '\r\n')
+
+	printf '{"ok":true,"service":{"running":%s,"uptime":"%s","auth_count":%s,"session_time":%s,"router_ip":"%s","lan_if":"%s","wan_if":"%s","qos_enabled":%s},"sessions":%s}\n' \
+		"$SERVICE_UP" "$UPTIME_STR" "$AUTH_COUNT" "$SESSION_TIME" \
+		"$ROUTER_IP" "$LAN_IF" "$WAN_IF" \
+		"$([ "$QOS" = "1" ] && echo true || echo false)" \
+		"$SESSIONS_JSON"
+	exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# GET: whitelist
+# ---------------------------------------------------------------------------
+if [ "$ACTION" = "whitelist" ]; then
+	. /lib/functions.sh
+	config_load captiveportal
+
+	DOMAINS_JSON=""
+	_collect_domain() {
+		local d="$1"
+		[ -z "$d" ] && return
+		[ -n "$DOMAINS_JSON" ] && DOMAINS_JSON="${DOMAINS_JSON},"
+		DOMAINS_JSON="${DOMAINS_JSON}\"$d\""
+	}
+	config_list_foreach walled_garden domain _collect_domain
+
+	printf '{"ok":true,"domains":[%s]}\n' "$DOMAINS_JSON"
+	exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# GET: profiles
+# ---------------------------------------------------------------------------
+if [ "$ACTION" = "profiles" ]; then
+	. /lib/functions.sh
+	config_load captiveportal
+
+	PROFILES_JSON=""
+	_collect_profile() {
+		local cfg="$1"
+		local name fwmark dl ul
+		config_get name   "$cfg" name
+		config_get fwmark "$cfg" fwmark
+		config_get dl     "$cfg" dl_kbit 0
+		config_get ul     "$cfg" ul_kbit 0
+		[ -n "$PROFILES_JSON" ] && PROFILES_JSON="${PROFILES_JSON},"
+		PROFILES_JSON="${PROFILES_JSON}{\"id\":\"$cfg\",\"name\":\"$name\",\"fwmark\":$fwmark,\"dl_kbit\":$dl,\"ul_kbit\":$ul}"
+	}
+	config_foreach _collect_profile profile
+
+	printf '{"ok":true,"profiles":[%s]}\n' "$PROFILES_JSON"
+	exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# POST: kick (por IP)
+# ---------------------------------------------------------------------------
+if [ "$ACTION" = "kick" ]; then
+	IP=$(_param ip)
+	[ -z "$IP" ] && json_error "ip parameter required"
+
+	_ipt_kick_ip "$IP"
+
+	# Remove do arquivo de sessões
+	if [ -f "$SESSIONS_FILE" ]; then
+		OTHER=$(cat "$SESSIONS_FILE" | \
+			sed 's/{"sessions":\[//; s/\]}//' | \
+			sed "s/{\"ip\":\"$IP\"[^}]*},\?//g" | \
+			sed 's/^,//; s/,$//; s/,,/,/g')
+		[ -n "$OTHER" ] && \
+			printf '{"sessions":[%s]}' "$OTHER" > "$SESSIONS_FILE" || \
+			printf '{"sessions":[]}' > "$SESSIONS_FILE"
+	fi
+
+	logger -t captive_admin "Sessão encerrada (kick): IP=$IP"
+	json_ok "\"message\":\"Cliente $IP desconectado\""
+fi
+
+# ---------------------------------------------------------------------------
+# POST: kick_mac
+# ---------------------------------------------------------------------------
+if [ "$ACTION" = "kick_mac" ]; then
+	MAC=$(_param mac)
+	[ -z "$MAC" ] && json_error "mac parameter required"
+
+	IP=$(awk -v ip="" -v mac="$MAC" '
+		/"ip"/ { match($0, /"ip":"([^"]+)"/, a); cur_ip = a[1] }
+		/"mac"/ { match($0, /"mac":"([^"]+)"/, a); if (tolower(a[1]) == tolower(mac)) { print cur_ip; exit } }
+	' "$SESSIONS_FILE" 2>/dev/null)
+
+	[ -z "$IP" ] && IP=$(awk -v mac="$MAC" '$0 ~ mac {print $1}' /proc/net/arp 2>/dev/null | head -1)
+	[ -z "$IP" ] && json_error "MAC não encontrado em sessões ativas"
+
+	_ipt_kick_ip "$IP"
+	OTHER=$(cat "$SESSIONS_FILE" | \
+		sed 's/{"sessions":\[//; s/\]}//' | \
+		sed "s/{\"ip\":\"$IP\"[^}]*},\?//g" | \
+		sed 's/^,//; s/,$//; s/,,/,/g')
+	[ -n "$OTHER" ] && \
+		printf '{"sessions":[%s]}' "$OTHER" > "$SESSIONS_FILE" || \
+		printf '{"sessions":[]}' > "$SESSIONS_FILE"
+
+	logger -t captive_admin "Sessão encerrada (kick-mac): MAC=$MAC IP=$IP"
+	json_ok "\"message\":\"Cliente MAC $MAC (IP $IP) desconectado\""
+fi
+
+# ---------------------------------------------------------------------------
+# POST: flush
+# ---------------------------------------------------------------------------
+if [ "$ACTION" = "flush" ]; then
+	# Limpa chain de autenticados no iptables
+	iptables        -F CAPTIVE_AUTH_FWD    2>/dev/null || true
+	iptables -t nat -F CAPTIVE_AUTH_RETURN 2>/dev/null || true
+	iptables -t mangle -F CAPTIVE_MANGLE  2>/dev/null || true
+	printf '{"sessions":[]}' > "$SESSIONS_FILE"
+	logger -t captive_admin "Todas as sessões encerradas (flush)"
+	json_ok "\"message\":\"Todos os clientes desconectados\""
+fi
+
+# ---------------------------------------------------------------------------
+# POST: whitelist_add
+# ---------------------------------------------------------------------------
+if [ "$ACTION" = "whitelist_add" ]; then
+	DOMAIN=$(_param domain)
+	[ -z "$DOMAIN" ] && json_error "domain parameter required"
+	DOMAIN=$(printf '%s' "$DOMAIN" | tr -cd 'a-zA-Z0-9.-')
+	[ -z "$DOMAIN" ] && json_error "invalid domain name"
+
+	uci add_list captiveportal.walled_garden.domain="$DOMAIN"
+	uci commit captiveportal
+	_persist_config
+
+	# Atualiza dnsmasq instantaneamente sem travar a requisição
+	echo "# domínio liberado: $DOMAIN" >> /tmp/dnsmasq.d/captive-whitelist.conf
+	/etc/init.d/dnsmasq reload >/dev/null 2>&1 || true
+
+	# Atualiza resolução em background
+	/etc/captiveportal/refresh-whitelist.sh >/dev/null 2>&1 &
+
+	logger -t captive_admin "Whitelist add: $DOMAIN"
+	json_ok "\"message\":\"Domínio $DOMAIN adicionado com sucesso\""
+fi
+
+# ---------------------------------------------------------------------------
+# POST: whitelist_del
+# ---------------------------------------------------------------------------
+if [ "$ACTION" = "whitelist_del" ]; then
+	DOMAIN=$(_param domain)
+	[ -z "$DOMAIN" ] && json_error "domain parameter required"
+	DOMAIN=$(printf '%s' "$DOMAIN" | tr -cd 'a-zA-Z0-9.-')
+	[ -z "$DOMAIN" ] && json_error "invalid domain name"
+
+	uci del_list captiveportal.walled_garden.domain="$DOMAIN"
+	uci commit captiveportal
+	_persist_config
+
+	# Recarrega em background para não travar a resposta HTTP
+	(/etc/init.d/captiveportal restart >/dev/null 2>&1) &
+
+	logger -t captive_admin "Whitelist del: $DOMAIN"
+	json_ok "\"message\":\"Domínio $DOMAIN removido com sucesso\""
+fi
+
+# ---------------------------------------------------------------------------
+# POST: service_restart
+# ---------------------------------------------------------------------------
+if [ "$ACTION" = "service_restart" ]; then
+	/etc/init.d/captiveportal restart >/dev/null 2>&1
+	logger -t captive_admin "Serviço reiniciado via painel"
+	json_ok "\"message\":\"Serviço reiniciado com sucesso\""
+fi
+
+# ---------------------------------------------------------------------------
+# POST: service_stop / service_start
+# ---------------------------------------------------------------------------
+if [ "$ACTION" = "service_stop" ]; then
+	/etc/init.d/captiveportal stop >/dev/null 2>&1
+	json_ok "\"message\":\"Serviço parado\""
+fi
+
+if [ "$ACTION" = "service_start" ]; then
+	/etc/init.d/captiveportal start >/dev/null 2>&1
+	json_ok "\"message\":\"Serviço iniciado\""
+fi
+
+# ---------------------------------------------------------------------------
+# POST: profile_update
+# ---------------------------------------------------------------------------
+if [ "$ACTION" = "profile_update" ]; then
+	ID=$(_param id)
+	DL=$(_param dl_kbit)
+	UL=$(_param ul_kbit)
+	[ -z "$ID" ] && json_error "id parameter required"
+
+	ID=$(printf '%s' "$ID" | tr -cd 'a-zA-Z0-9_')
+	DL=$(printf '%s' "$DL" | tr -cd '0-9')
+	UL=$(printf '%s' "$UL" | tr -cd '0-9')
+	[ -z "$DL" ] && DL=0
+	[ -z "$UL" ] && UL=0
+
+	uci set captiveportal."$ID".dl_kbit="$DL"
+	uci set captiveportal."$ID".ul_kbit="$UL"
+	uci commit captiveportal
+	_persist_config
+
+	# Reaplica as classes HTB do QoS em background
+	(/etc/init.d/captiveportal setup_tc >/dev/null 2>&1) &
+
+	logger -t captive_admin "Perfil $ID atualizado: DL=${DL}kbit UL=${UL}kbit"
+	json_ok "\"message\":\"Perfil de QoS atualizado com sucesso\""
+fi
+
+# ---------------------------------------------------------------------------
+# POST: qos_toggle / qos_set
+# ---------------------------------------------------------------------------
+if [ "$ACTION" = "qos_toggle" ] || [ "$ACTION" = "qos_set" ]; then
+	STATE=$(_param enabled)
+	if [ -z "$STATE" ]; then
+		CURR=$(uci -q get captiveportal.global.enable_qos 2>/dev/null || echo "1")
+		if [ "$CURR" = "1" ]; then
+			STATE="0"
+		else
+			STATE="1"
+		fi
+	fi
+	STATE=$(printf '%s' "$STATE" | tr -cd '01')
+	[ -z "$STATE" ] && STATE=1
+
+	uci set captiveportal.global.enable_qos="$STATE"
+	uci commit captiveportal
+	_persist_config
+
+	if [ "$STATE" = "1" ]; then
+		(/etc/init.d/captiveportal setup_tc >/dev/null 2>&1) &
+		# Re-aplica marcas de QoS em tempo real para todas as sessões já conectadas
+		if [ -f "$SESSIONS_FILE" ]; then
+			grep -o '{"ip":"[^"]*","mac":"[^"]*","user":"[^"]*","email":"[^"]*","profile":"[^"]*","fwmark":[0-9]*' "$SESSIONS_FILE" 2>/dev/null | while read -r sess; do
+				s_ip=$(echo "$sess" | sed -n 's/.*"ip":"\([^"]*\)".*/\1/p')
+				s_mark=$(echo "$sess" | sed -n 's/.*"fwmark":\([0-9]*\).*/\1/p')
+				if [ -n "$s_ip" ] && [ -n "$s_mark" ]; then
+					iptables -t mangle -D CAPTIVE_MANGLE_PRE -s "$s_ip" -j BLOGSKIP 2>/dev/null || true
+					iptables -t mangle -A CAPTIVE_MANGLE_PRE -s "$s_ip" -j BLOGSKIP 2>/dev/null || true
+					iptables -t mangle -D CAPTIVE_MANGLE_PRE -d "$s_ip" -j BLOGSKIP 2>/dev/null || true
+					iptables -t mangle -A CAPTIVE_MANGLE_PRE -d "$s_ip" -j BLOGSKIP 2>/dev/null || true
+					iptables -t mangle -D CAPTIVE_MANGLE_POST -s "$s_ip" -j MARK --set-mark "$s_mark" 2>/dev/null || true
+					iptables -t mangle -A CAPTIVE_MANGLE_POST -s "$s_ip" -j MARK --set-mark "$s_mark" 2>/dev/null || true
+					iptables -t mangle -D CAPTIVE_MANGLE_POST -d "$s_ip" -j MARK --set-mark "$s_mark" 2>/dev/null || true
+					iptables -t mangle -A CAPTIVE_MANGLE_POST -d "$s_ip" -j MARK --set-mark "$s_mark" 2>/dev/null || true
+				fi
+			done
+			/sbin/fc flush >/dev/null 2>&1 || true
+		fi
+		MSG="Controle de Banda (QoS) ativado em tempo real"
+	else
+		(/etc/init.d/captiveportal teardown_tc >/dev/null 2>&1) &
+		iptables -t mangle -F CAPTIVE_MANGLE_PRE 2>/dev/null || true
+		iptables -t mangle -F CAPTIVE_MANGLE_POST 2>/dev/null || true
+		/sbin/fc flush >/dev/null 2>&1 || true
+		MSG="Controle de Banda (QoS) desativado em tempo real (Aceleração HW Total)"
+	fi
+
+	logger -t captive_admin "QoS alterado: enable_qos=$STATE"
+	json_ok "\"message\":\"$MSG\",\"qos_enabled\":$([ "$STATE" = "1" ] && echo true || echo false)"
+fi
+
+# ============================================================================
+# CLOUD CONTROLLER (GESTÃO DE FROTA)
+# ============================================================================
+if [ "$ACTION" = "get_cloud_config" ]; then
+	if [ -s /data/etc/config/floresta_cloud ]; then
+		cp -f /data/etc/config/floresta_cloud /etc/config/floresta_cloud 2>/dev/null || true
+	elif [ -s /user_data1/etc/config/floresta_cloud ]; then
+		cp -f /user_data1/etc/config/floresta_cloud /etc/config/floresta_cloud 2>/dev/null || true
+	fi
+	CLOUD_URL=$(/sbin/uci -q get floresta_cloud.global.server_url 2>/dev/null || echo "https://<CONTROLLER_HOST>/ws/router")
+	# Limpa qualquer resíduo com wss:// ou ws://: NUNCA force wss
+	CLOUD_URL=$(echo "$CLOUD_URL" | sed -e 's,^wss://,https://,g' -e 's,^ws://,http://,g')
+	CLOUD_HOST=$(/sbin/uci -q get floresta_cloud.global.server_host 2>/dev/null || echo "<CONTROLLER_HOST>")
+	CLOUD_PORT=$(/sbin/uci -q get floresta_cloud.global.server_port 2>/dev/null || echo "443")
+	CLOUD_NAME=$(/sbin/uci -q get floresta_cloud.global.device_name 2>/dev/null || echo "Archer BE220")
+	IS_RUNNING=false
+	if pgrep -f "floresta_agent" >/dev/null 2>&1; then
+		IS_RUNNING=true
+	fi
+	json_ok "\"server_url\":\"$CLOUD_URL\",\"server_host\":\"$CLOUD_HOST\",\"server_port\":$CLOUD_PORT,\"device_name\":\"$CLOUD_NAME\",\"running\":$IS_RUNNING"
+fi
+
+if [ "$ACTION" = "set_cloud_config" ]; then
+	NEW_URL=$(_param "server_url")
+	NEW_NAME=$(_param "device_name")
+
+	# Restaura cópia persistente se existir antes de modificar
+	if [ -s /data/etc/config/floresta_cloud ]; then
+		cp -f /data/etc/config/floresta_cloud /etc/config/floresta_cloud 2>/dev/null || true
+	elif [ -s /user_data1/etc/config/floresta_cloud ]; then
+		cp -f /user_data1/etc/config/floresta_cloud /etc/config/floresta_cloud 2>/dev/null || true
+	elif [ ! -f /etc/config/floresta_cloud ]; then
+		touch /etc/config/floresta_cloud 2>/dev/null || true
+	fi
+	if ! /sbin/uci -q get floresta_cloud.global >/dev/null 2>&1; then
+		/sbin/uci set floresta_cloud.global='floresta_cloud'
+	fi
+
+	if [ -n "$NEW_NAME" ]; then
+		uci set floresta_cloud.global.device_name="$NEW_NAME"
+		uci commit floresta_cloud
+	fi
+
+	if [ -n "$NEW_URL" ]; then
+		# Limpa protocolo: NUNCA força nem permite wss:// ou ws:// na URL gravada
+		CLEAN_URL=$(echo "$NEW_URL" | sed -e 's,^wss://,https://,g' -e 's,^ws://,http://,g')
+		if ! echo "$CLEAN_URL" | grep -q '://'; then
+			if echo "$CLEAN_URL" | grep -qE '\.run\.app' || echo "$CLEAN_URL" | grep -q ':443'; then
+				CLEAN_URL="https://${CLEAN_URL}"
+			else
+				CLEAN_URL="http://${CLEAN_URL}"
+			fi
+		fi
+
+		# Tenta utilitário set-inform atualizado de /data ou /user_data1 ou /usr/bin
+		if [ -x /data/set-inform ]; then
+			/data/set-inform "$CLEAN_URL" >/dev/null 2>&1
+		elif [ -x /user_data1/set-inform ]; then
+			/user_data1/set-inform "$CLEAN_URL" >/dev/null 2>&1
+		elif [ -x /usr/bin/set-inform ]; then
+			/usr/bin/set-inform "$CLEAN_URL" >/dev/null 2>&1
+		elif [ -x /bin/set-inform ]; then
+			/bin/set-inform "$CLEAN_URL" >/dev/null 2>&1
+		fi
+
+		# Garantia estrita: server_url no UCI sempre fica https:// ou http:// (NUNCA wss)
+		/sbin/uci set floresta_cloud.global.server_url="$CLEAN_URL"
+		/sbin/uci commit floresta_cloud
+	fi
+
+	# Persistir alterações no /data e /user_data1
+	mkdir -p /data/etc/config /user_data1/etc/config 2>/dev/null || true
+	cp -f /etc/config/floresta_cloud /data/etc/config/ 2>/dev/null || true
+	cp -f /etc/config/floresta_cloud /user_data1/etc/config/ 2>/dev/null || true
+	sync 2>/dev/null || true
+
+	# Sempre reinicia o agente para reconectar com a nova URL e/ou nome
+	killall -9 lua floresta_agent.lua 2>/dev/null || true
+	sleep 1
+	if [ -f /data/floresta_agent.lua ]; then
+		/usr/bin/lua /data/floresta_agent.lua >/tmp/floresta_agent.log 2>&1 &
+	elif [ -f /usr/bin/floresta_agent.lua ]; then
+		/usr/bin/lua /usr/bin/floresta_agent.lua >/tmp/floresta_agent.log 2>&1 &
+	fi
+
+	json_ok "\"message\":\"Configuração do Cloud Controller atualizada com sucesso!\""
+fi
+
+json_error "Ação desconhecida: $ACTION"

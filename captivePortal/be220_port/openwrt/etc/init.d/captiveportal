@@ -1,0 +1,637 @@
+#!/bin/sh /etc/rc.common
+# Portal Captivo 3000 — BE220 Port (iptables / BusyBox rc.common)
+# /etc/init.d/captiveportal
+#
+# Adaptado de OpenWrt 23+ (nftables/procd) para:
+#   - TP-Link Archer BE220 (BCM6764) — BusyBox ash + rc.common
+#   - iptables (sem nftables, sem fw3/fw4)
+#   - wget no lugar de uclient-fetch
+#
+# Uso:
+#   /etc/init.d/captiveportal start   — aplica regras iptables + dnsmasq
+#   /etc/init.d/captiveportal stop    — remove todas as regras
+#   /etc/init.d/captiveportal restart — recarrega
+#   /etc/init.d/captiveportal enable  — habilita no boot (symlink rc.d)
+#   /etc/init.d/captiveportal disable — desabilita no boot
+
+START=95
+STOP=05
+
+export PATH=/sbin:/bin:/usr/sbin:/usr/bin:$PATH
+
+CAPTIVE_CONF="/etc/config/captiveportal"
+DNSMASQ_WHITELIST="/tmp/dnsmasq.d/captive-whitelist.conf"
+DNSMASQ_BLACKLIST="/tmp/dnsmasq.d/captive-blacklist.conf"
+SESSIONS_FILE="/tmp/captiveportal_sessions.json"
+
+# ---------------------------------------------------------------------------
+# Lê configuração UCI
+# ---------------------------------------------------------------------------
+_load_config() {
+	# Restaura configuração persistente salva nas partições UBIFS NAND (/data ou /user_data1)
+	# Nota: no boot (S10boot), o loadconfig da TP-Link executa 'rm -rf /etc/config', apagando arquivos que não estavam no XML da NVRAM.
+	if [ -s /data/captiveportal/captiveportal ] && grep -q "config profile" /data/captiveportal/captiveportal 2>/dev/null; then
+		cp -f /data/captiveportal/captiveportal /etc/config/captiveportal
+		logger -t captiveportal "Configuração persistente restaurada de /data/captiveportal/captiveportal"
+	elif [ -s /user_data1/captiveportal/captiveportal ] && grep -q "config profile" /user_data1/captiveportal/captiveportal 2>/dev/null; then
+		cp -f /user_data1/captiveportal/captiveportal /etc/config/captiveportal
+		logger -t captiveportal "Configuração persistente restaurada de /user_data1/captiveportal/captiveportal"
+	elif [ ! -s /etc/config/captiveportal ] || ! grep -q "config profile" /etc/config/captiveportal 2>/dev/null; then
+		if [ -s /etc/captiveportal/captiveportal.default ]; then
+			cp -f /etc/captiveportal/captiveportal.default /etc/config/captiveportal
+		elif [ -s /rom/etc/config/captiveportal ]; then
+			cp -f /rom/etc/config/captiveportal /etc/config/captiveportal
+		else
+			cat << 'EOF' > /etc/config/captiveportal
+config captiveportal 'global'
+	option enable_qos     '1'
+	option wan_speed      '800mbit'
+	option api_url        'https://apidev.conexaopovosdafloresta.org.br'
+	option api_user_path  '/api/user/me'
+	option session_time   '3600'
+	option wan_interface  'eth0'
+	option lan_interface  'br-lan'
+	option router_ip      '192.168.12.1'
+	option router_domain  'roteador.conexaopovosdafloresta.org.br'
+	option portal_port    '2080'
+
+config captiveportal 'walled_garden'
+	list domain '192.168.12.1'
+	list domain '192.168.0.1'
+	list domain 'tplinkwifi.net'
+	list domain 'tplinklogin.net'
+	list domain 'apidev.conexaopovosdafloresta.org.br'
+	list domain 'conexaopovosdafloresta.org.br'
+	list domain 'paineldecontrole-dev.conexaopovosdafloresta.org.br'
+	list domain 'roteador.conexaopovosdafloresta.org.br'
+	list domain '*.conexaopovosdafloresta.org.br'
+
+config captiveportal 'blacklist'
+	option enabled        '1'
+	option community_url  'https://raw.githubusercontent.com/StevenBlack/hosts/master/alternates/porn/hosts'
+	list domain 'siteindesejado.com'
+
+config profile 'visitante'
+	option name     'Visitante'
+	option fwmark   '1'
+	option dl_kbit  '2048'
+	option ul_kbit  '1024'
+
+config profile 'basico'
+	option name     'Básico'
+	option fwmark   '2'
+	option dl_kbit  '5120'
+	option ul_kbit  '2048'
+
+config profile 'premium'
+	option name     'Premium'
+	option fwmark   '3'
+	option dl_kbit  '20480'
+	option ul_kbit  '10240'
+
+config profile 'ilimitado'
+	option name     'Ilimitado'
+	option fwmark   '4'
+	option dl_kbit  '0'
+	option ul_kbit  '0'
+EOF
+		fi
+		mkdir -p /data/captiveportal /user_data1/captiveportal 2>/dev/null || true
+		cp -f /etc/config/captiveportal /data/captiveportal/captiveportal 2>/dev/null || true
+		cp -f /etc/config/captiveportal /user_data1/captiveportal/captiveportal 2>/dev/null || true
+		sync 2>/dev/null || true
+		logger -t captiveportal "Configuração padrão de fábrica inicializada em /etc/config/captiveportal e persistida em /data"
+	else
+		mkdir -p /data/captiveportal /user_data1/captiveportal 2>/dev/null || true
+		cp -f /etc/config/captiveportal /data/captiveportal/captiveportal 2>/dev/null || true
+		cp -f /etc/config/captiveportal /user_data1/captiveportal/captiveportal 2>/dev/null || true
+		sync 2>/dev/null || true
+	fi
+
+	API_URL=$(uci -q get captiveportal.global.api_url)
+	API_USER_PATH=$(uci -q get captiveportal.global.api_user_path)
+	SESSION_TIME=$(uci -q get captiveportal.global.session_time)
+	WAN_IF=$(uci -q get captiveportal.global.wan_interface)
+	LAN_IF=$(uci -q get captiveportal.global.lan_interface)
+	ROUTER_IP=$(uci -q get captiveportal.global.router_ip)
+	ROUTER_DOMAIN=$(uci -q get captiveportal.global.router_domain)
+	PORTAL_PORT=$(uci -q get captiveportal.global.portal_port)
+
+	: ${SESSION_TIME:=3600}
+	if [ -z "$WAN_IF" ] || ! ip link show "$WAN_IF" >/dev/null 2>&1; then
+		AUTO_WAN=$(ip route show default 2>/dev/null | awk '/default/ {print $5}' | head -n1)
+		[ -n "$AUTO_WAN" ] && WAN_IF="$AUTO_WAN"
+	fi
+	: ${WAN_IF:=eth0}
+	: ${LAN_IF:=br-lan}
+
+	# Detecta o IP real da LAN dinamicamente (interface ativa ou UCI network.lan.ipaddr)
+	LAN_IP_DETECTED=$(ip -4 addr show "$LAN_IF" 2>/dev/null | awk '/inet / {print $2}' | cut -d/ -f1 | head -n1)
+	[ -z "$LAN_IP_DETECTED" ] && LAN_IP_DETECTED=$(uci -q get network.lan.ipaddr 2>/dev/null)
+	if [ -n "$LAN_IP_DETECTED" ]; then
+		ROUTER_IP="$LAN_IP_DETECTED"
+	fi
+	: ${ROUTER_IP:=192.168.0.1}
+	: ${ROUTER_DOMAIN:=roteador.conexaopovosdafloresta.org.br}
+	: ${PORTAL_PORT:=2080}
+}
+
+# ---------------------------------------------------------------------------
+# Cria chains iptables do portal captivo
+# ---------------------------------------------------------------------------
+_apply_ipt_rules() {
+	logger -t captiveportal "Criando chains iptables: LAN=$LAN_IF WAN=$WAN_IF ROUTER=$ROUTER_IP"
+
+	# -----------------------------------------------------------------------
+	# NAT / PREROUTING: redireciona HTTP de não-autenticados para portal
+	# -----------------------------------------------------------------------
+	iptables -t nat -N CAPTIVE_PREROUTING 2>/dev/null || iptables -t nat -F CAPTIVE_PREROUTING
+	iptables -t nat -N CAPTIVE_AUTH_RETURN 2>/dev/null || iptables -t nat -F CAPTIVE_AUTH_RETURN
+	iptables -t nat -N CAPTIVE_WARDEN 2>/dev/null     || iptables -t nat -F CAPTIVE_WARDEN
+
+	# Insere o ponto de entrada da chain no topo do PREROUTING
+	iptables -t nat -C PREROUTING -j CAPTIVE_PREROUTING 2>/dev/null || \
+		iptables -t nat -I PREROUTING 1 -j CAPTIVE_PREROUTING
+
+	# Regras dentro de CAPTIVE_PREROUTING
+	iptables -t nat -A CAPTIVE_PREROUTING ! -i "$LAN_IF" -j RETURN \
+		-m comment --comment "captive:skip_wan"
+	iptables -t nat -A CAPTIVE_PREROUTING -p udp --dport 53 -j REDIRECT --to-ports 53 \
+		-m comment --comment "captive:force_dns_udp"
+	iptables -t nat -A CAPTIVE_PREROUTING -p tcp --dport 53 -j REDIRECT --to-ports 53 \
+		-m comment --comment "captive:force_dns_tcp"
+	# Walled garden (IPs liberados por domínio)
+	iptables -t nat -A CAPTIVE_PREROUTING -j CAPTIVE_WARDEN
+	# Clientes autenticados (pula redirecionamento)
+	iptables -t nat -A CAPTIVE_PREROUTING -j CAPTIVE_AUTH_RETURN
+	# Tráfego destinado ao roteador (WebUI, captive portal, cgi-bin, SSH) não é redirecionado
+	iptables -t nat -A CAPTIVE_PREROUTING -d "$ROUTER_IP" -j RETURN \
+		-m comment --comment "captive:skip_router"
+	iptables -t nat -A CAPTIVE_PREROUTING -d 127.0.0.1 -j RETURN \
+		-m comment --comment "captive:skip_loopback"
+	[ "$ROUTER_IP" != "192.168.0.1" ] && iptables -t nat -A CAPTIVE_PREROUTING -d 192.168.0.1 -j RETURN \
+		-m comment --comment "captive:skip_default_ip" 2>/dev/null || true
+	[ "$ROUTER_IP" != "192.168.12.1" ] && iptables -t nat -A CAPTIVE_PREROUTING -d 192.168.12.1 -j RETURN \
+		-m comment --comment "captive:skip_current_ip" 2>/dev/null || true
+	for lip in $(ip -4 addr show "$LAN_IF" 2>/dev/null | awk '/inet / {print $2}' | cut -d/ -f1); do
+		iptables -t nat -A CAPTIVE_PREROUTING -d "$lip" -j RETURN 2>/dev/null || true
+	done
+	# Redireciona TODO tráfego HTTP externo porta 80 para o daemon dedicado Lua
+	iptables -t nat -A CAPTIVE_PREROUTING -p tcp --dport 80 -j REDIRECT --to-ports "$PORTAL_PORT" \
+		-m comment --comment "captive:redirect_http"
+
+	# -----------------------------------------------------------------------
+	# FILTER / FORWARD: bloqueia LAN→WAN para não-autenticados
+	# -----------------------------------------------------------------------
+	iptables -N CAPTIVE_FORWARD 2>/dev/null    || iptables -F CAPTIVE_FORWARD
+	iptables -N CAPTIVE_AUTH_FWD 2>/dev/null   || iptables -F CAPTIVE_AUTH_FWD
+	iptables -N CAPTIVE_WARDEN_FWD 2>/dev/null || iptables -F CAPTIVE_WARDEN_FWD
+
+	iptables -C FORWARD -j CAPTIVE_FORWARD 2>/dev/null || \
+		iptables -I FORWARD 1 -j CAPTIVE_FORWARD
+
+	iptables -A CAPTIVE_FORWARD ! -i "$LAN_IF" -j RETURN \
+		-m comment --comment "captive:fwd_skip_wan"
+	iptables -A CAPTIVE_FORWARD ! -o "$WAN_IF" -j RETURN \
+		-m comment --comment "captive:fwd_skip_nonwan"
+	# Rejeita DoT (DNS over TLS, porta 853) para o Android não travar no Private DNS
+	iptables -A CAPTIVE_FORWARD -p tcp --dport 853 -j REJECT --reject-with tcp-reset \
+		-m comment --comment "captive:reject_dot_tcp"
+	iptables -A CAPTIVE_FORWARD -p udp --dport 853 -j REJECT \
+		-m comment --comment "captive:reject_dot_udp"
+	iptables -A CAPTIVE_FORWARD -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+	iptables -A CAPTIVE_FORWARD -d "$ROUTER_IP" -j RETURN
+	iptables -A CAPTIVE_FORWARD -s "$ROUTER_IP" -j RETURN
+	iptables -A CAPTIVE_FORWARD -d 127.0.0.1 -j RETURN
+	iptables -A CAPTIVE_FORWARD -s 127.0.0.1 -j RETURN
+	for lip in $(ip -4 addr show "$LAN_IF" 2>/dev/null | awk '/inet / {print $2}' | cut -d/ -f1); do
+		iptables -A CAPTIVE_FORWARD -d "$lip" -j RETURN 2>/dev/null || true
+		iptables -A CAPTIVE_FORWARD -s "$lip" -j RETURN 2>/dev/null || true
+	done
+	iptables -A CAPTIVE_FORWARD -j CAPTIVE_WARDEN_FWD
+	iptables -A CAPTIVE_FORWARD -j CAPTIVE_AUTH_FWD
+	iptables -A CAPTIVE_FORWARD -j DROP \
+		-m comment --comment "captive:block_unauthenticated"
+
+	# -----------------------------------------------------------------------
+	# MANGLE: controle de tráfego, Broadcom Flow Cache e QoS HTB
+	# -----------------------------------------------------------------------
+	# PREROUTING: CAPTIVE_MANGLE_PRE (aplica BLOGSKIP para impedir bypass do Flow Cache)
+	iptables -t mangle -N CAPTIVE_MANGLE_PRE 2>/dev/null || iptables -t mangle -F CAPTIVE_MANGLE_PRE
+	iptables -t mangle -C PREROUTING -j CAPTIVE_MANGLE_PRE 2>/dev/null || \
+		iptables -t mangle -I PREROUTING 1 -j CAPTIVE_MANGLE_PRE
+
+	# POSTROUTING: CAPTIVE_MANGLE_POST (aplica fwmark após zone_lan_qos / zone_wan_qos)
+	iptables -t mangle -N CAPTIVE_MANGLE_POST 2>/dev/null || iptables -t mangle -F CAPTIVE_MANGLE_POST
+	iptables -t mangle -C POSTROUTING -j CAPTIVE_MANGLE_POST 2>/dev/null || \
+		iptables -t mangle -I POSTROUTING 1 -j CAPTIVE_MANGLE_POST
+
+	# FORWARD legado: CAPTIVE_MANGLE
+	iptables -t mangle -N CAPTIVE_MANGLE 2>/dev/null || iptables -t mangle -F CAPTIVE_MANGLE
+	iptables -t mangle -C FORWARD -j CAPTIVE_MANGLE 2>/dev/null || \
+		iptables -t mangle -I FORWARD 1 -j CAPTIVE_MANGLE
+
+	logger -t captiveportal "Regras iptables aplicadas com sucesso."
+}
+
+# ---------------------------------------------------------------------------
+# Remove todas as chains do portal
+# ---------------------------------------------------------------------------
+_remove_ipt_rules() {
+	logger -t captiveportal "Removendo regras iptables do portal captivo..."
+
+	# Remove pontos de entrada
+	iptables -t nat    -D PREROUTING  -j CAPTIVE_PREROUTING  2>/dev/null || true
+	iptables          -D FORWARD     -j CAPTIVE_FORWARD     2>/dev/null || true
+	iptables -t mangle -D PREROUTING  -j CAPTIVE_MANGLE_PRE  2>/dev/null || true
+	iptables -t mangle -D POSTROUTING -j CAPTIVE_MANGLE_POST 2>/dev/null || true
+	iptables -t mangle -D FORWARD     -j CAPTIVE_MANGLE      2>/dev/null || true
+
+	# Flush e remoção das chains
+	for chain in CAPTIVE_PREROUTING CAPTIVE_AUTH_RETURN CAPTIVE_WARDEN; do
+		iptables -t nat -F "$chain" 2>/dev/null || true
+		iptables -t nat -X "$chain" 2>/dev/null || true
+	done
+	for chain in CAPTIVE_FORWARD CAPTIVE_AUTH_FWD CAPTIVE_WARDEN_FWD; do
+		iptables -F "$chain" 2>/dev/null || true
+		iptables -X "$chain" 2>/dev/null || true
+	done
+	for chain in CAPTIVE_MANGLE CAPTIVE_MANGLE_PRE CAPTIVE_MANGLE_POST; do
+		iptables -t mangle -F "$chain" 2>/dev/null || true
+		iptables -t mangle -X "$chain" 2>/dev/null || true
+	done
+
+	logger -t captiveportal "Regras iptables removidas."
+}
+
+# ---------------------------------------------------------------------------
+# Adiciona IP ao walled garden (em memória — reconfigurado no reload)
+# ---------------------------------------------------------------------------
+_add_whitelist_ip() {
+	local ip="$1"
+	[ -z "$ip" ] && return
+	# Evita duplicatas
+	iptables -t nat -C CAPTIVE_WARDEN     -d "$ip" -j RETURN 2>/dev/null || \
+		iptables -t nat -A CAPTIVE_WARDEN -d "$ip" -j RETURN
+	iptables -C CAPTIVE_WARDEN_FWD        -d "$ip" -j ACCEPT 2>/dev/null || \
+		iptables -A CAPTIVE_WARDEN_FWD    -d "$ip" -j ACCEPT
+}
+
+_add_whitelist_domain() {
+	local domain="$1"
+	[ -z "$domain" ] && return
+
+	# Configuração dnsmasq (address= resolve domínio para o portal)
+	# Apenas adiciona entrada no arquivo de whitelist
+	echo "# domínio liberado: $domain" >> "$DNSMASQ_WHITELIST"
+
+	# Se for endereço IPv4 direto (ex: IP do roteador), libera diretamente sem nslookup
+	if echo "$domain" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'; then
+		_add_whitelist_ip "$domain"
+		logger -t captiveportal "  Walled garden IP direto: $domain"
+		return
+	fi
+
+	# Pré-popula IPs via nslookup
+	local ips
+	ips=$(nslookup "$domain" 2>/dev/null \
+		| awk '/^Address: / {print $2}' \
+		| grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$')
+	for ip in $ips; do
+		_add_whitelist_ip "$ip"
+		logger -t captiveportal "  Walled garden IP: $domain -> $ip"
+	done
+	logger -t captiveportal "  Domínio liberado: $domain"
+}
+
+# ---------------------------------------------------------------------------
+# Configura walled garden via dnsmasq
+# ---------------------------------------------------------------------------
+_setup_walled_garden() {
+	logger -t captiveportal "Gerando configuração walled garden..."
+	mkdir -p /tmp/dnsmasq.d
+
+	cat > "$DNSMASQ_WHITELIST" << 'HEADER'
+# Portal Captivo — Walled Garden (gerado automaticamente)
+# NÃO edite este arquivo. Use: uci add_list captiveportal.walled_garden.domain=...
+HEADER
+
+	# Garante que dnsmasq leia /tmp/dnsmasq.d/
+	if ! grep -q "conf-dir=/tmp/dnsmasq.d" /etc/dnsmasq.conf 2>/dev/null; then
+		echo "conf-dir=/tmp/dnsmasq.d" >> /etc/dnsmasq.conf
+	fi
+	uci set dhcp.@dnsmasq[0].confdir='/tmp/dnsmasq.d' 2>/dev/null || true
+	uci commit dhcp 2>/dev/null || true
+
+	# Domínio local do roteador e exceções de IP
+	_add_whitelist_ip "$ROUTER_IP"
+	_add_whitelist_ip "127.0.0.1"
+	_add_whitelist_ip "192.168.0.1"
+	_add_whitelist_ip "192.168.1.1"
+	_add_whitelist_ip "192.168.12.1"
+	for lip in $(ip -4 addr show "$LAN_IF" 2>/dev/null | awk '/inet / {print $2}' | cut -d/ -f1); do
+		_add_whitelist_ip "$lip"
+	done
+
+	if [ -n "$ROUTER_DOMAIN" ]; then
+		echo "address=/${ROUTER_DOMAIN}/${ROUTER_IP}" >> "$DNSMASQ_WHITELIST"
+		_add_whitelist_ip "$ROUTER_IP"
+		logger -t captiveportal "  Domínio local: $ROUTER_DOMAIN -> $ROUTER_IP"
+
+		# Adiciona ao /etc/hosts
+		if ! grep -q "$ROUTER_DOMAIN" /etc/hosts 2>/dev/null; then
+			echo "$ROUTER_IP $ROUTER_DOMAIN" >> /etc/hosts
+		fi
+
+		# RFC 8910 — DHCP Option 114 (CAPPORT)
+		echo "dhcp-option=114,http://${ROUTER_IP}/captive/" >> "$DNSMASQ_WHITELIST"
+
+		# Apple RFC: Notifica iOS para pausar iCloud Private Relay e abrir o CNA
+		echo "server=/mask.icloud.com/" >> "$DNSMASQ_WHITELIST"
+		echo "server=/mask-h2.icloud.com/" >> "$DNSMASQ_WHITELIST"
+	fi
+
+	# Host da api_url
+	if [ -n "$API_URL" ]; then
+		local api_host
+		api_host=$(echo "$API_URL" | sed 's|https\?://||; s|/.*||; s|:.*||')
+		[ -n "$api_host" ] && _add_whitelist_domain "$api_host"
+	fi
+
+	# Domínios configurados manualmente
+	. /lib/functions.sh
+	config_load captiveportal
+	config_list_foreach walled_garden domain _add_whitelist_domain
+
+	/etc/init.d/dnsmasq restart > /dev/null 2>&1 || true
+	logger -t captiveportal "Walled garden configurado."
+
+	# Cron: refresh de IPs a cada 2 minutos
+	local cron_entry="*/2 * * * * /etc/captiveportal/refresh-whitelist.sh"
+	if ! crontab -l 2>/dev/null | grep -q "refresh-whitelist"; then
+		(crontab -l 2>/dev/null; echo "$cron_entry") | crontab -
+		/etc/init.d/cron restart > /dev/null 2>&1 || true
+		logger -t captiveportal "  Cron refresh whitelist registrado (a cada 2min)"
+	fi
+
+	# Cron: renovação de sessões a cada 5 minutos
+	local cron_renew="*/5 * * * * /etc/captiveportal/renew-sessions.sh"
+	if ! crontab -l 2>/dev/null | grep -q "renew-sessions"; then
+		(crontab -l 2>/dev/null; echo "$cron_renew") | crontab -
+		/etc/init.d/cron restart > /dev/null 2>&1 || true
+		logger -t captiveportal "  Cron renovação de sessão registrado (a cada 5min)"
+	fi
+}
+
+# ---------------------------------------------------------------------------
+# Configura Blacklist DNS
+# ---------------------------------------------------------------------------
+_setup_blacklist() {
+	local enabled
+	enabled=$(uci -q get captiveportal.blacklist.enabled 2>/dev/null || echo "1")
+
+	if [ "$enabled" = "0" ] || [ "$enabled" = "off" ] || [ "$enabled" = "false" ]; then
+		rm -f "$DNSMASQ_BLACKLIST"
+		logger -t captiveportal "Blacklist DNS desabilitada."
+		return 0
+	fi
+
+	logger -t captiveportal "Configurando Blacklist DNS..."
+	mkdir -p /tmp/dnsmasq.d
+	> "$DNSMASQ_BLACKLIST"
+
+	config_get domains blacklist domain
+	for domain in $domains; do
+		[ -z "$domain" ] && continue
+		echo "address=/${domain}/${ROUTER_IP}" >> "$DNSMASQ_BLACKLIST"
+		logger -t captiveportal "  Blacklist: $domain -> $ROUTER_IP"
+	done
+
+	/etc/init.d/dnsmasq restart > /dev/null 2>&1 || true
+}
+
+# ---------------------------------------------------------------------------
+# Configura QoS via tc/HTB
+# ---------------------------------------------------------------------------
+_setup_tc() {
+	local enable_qos
+	enable_qos=$(uci -q get captiveportal.global.enable_qos 2>/dev/null || echo "1")
+
+	if [ "$enable_qos" = "0" ] || [ "$enable_qos" = "off" ] || [ "$enable_qos" = "false" ]; then
+		logger -t captiveportal "QoS desabilitado nas configurações."
+		_teardown_tc
+		return 0
+	fi
+
+	command -v tc >/dev/null 2>&1 || {
+		logger -t captiveportal "AVISO: 'tc' não encontrado — QoS desabilitado."
+		return 0
+	}
+
+	local wan_speed
+	wan_speed=$(uci -q get captiveportal.global.wan_speed 2>/dev/null || echo "800mbit")
+	: ${wan_speed:=800mbit}
+
+	logger -t captiveportal "Configurando tc/HTB em $WAN_IF e $LAN_IF (WAN: $wan_speed)..."
+
+	# Upload shaping no WAN_IF
+	tc qdisc del dev "$WAN_IF" root 2>/dev/null || true
+	tc qdisc add dev "$WAN_IF" root handle 1: htb default 9999 r2q 1
+	tc class add dev "$WAN_IF" parent 1: classid 1:1 htb rate "$wan_speed" ceil "$wan_speed" burst 100k cburst 100k quantum 1514
+	tc class add dev "$WAN_IF" parent 1:1 classid 1:9999 htb rate 512kbit ceil 1mbit prio 7 quantum 1514
+
+	# Download shaping no LAN_IF
+	tc qdisc del dev "$LAN_IF" root 2>/dev/null || true
+	tc qdisc add dev "$LAN_IF" root handle 1: htb default 9999 r2q 1
+	tc class add dev "$LAN_IF" parent 1: classid 1:1 htb rate "$wan_speed" ceil "$wan_speed" burst 100k cburst 100k quantum 1514
+	tc class add dev "$LAN_IF" parent 1:1 classid 1:9999 htb rate 512kbit ceil 1mbit prio 7 quantum 1514
+
+	config_foreach _setup_tc_profile profile
+	logger -t captiveportal "Classes tc/HTB configuradas para Download e Upload."
+}
+
+_setup_tc_profile() {
+	local cfg="$1"
+	local name fwmark dl_kbit ul_kbit
+	config_get name    "$cfg" name
+	config_get fwmark  "$cfg" fwmark
+	config_get dl_kbit "$cfg" dl_kbit 0
+	config_get ul_kbit "$cfg" ul_kbit 0
+	[ -z "$fwmark" ] && return
+
+	local class_id="1:$((100 + fwmark))"
+	local wan_speed
+	wan_speed=$(uci -q get captiveportal.global.wan_speed 2>/dev/null || echo "800mbit")
+
+	# Upload no WAN_IF
+	if [ "$ul_kbit" = "0" ]; then
+		tc class add dev "$WAN_IF" parent 1:1 classid "$class_id" htb rate "$wan_speed" ceil "$wan_speed" burst 50k cburst 50k prio 1 quantum 1514
+	else
+		tc class add dev "$WAN_IF" parent 1:1 classid "$class_id" htb rate "${ul_kbit}kbit" ceil "${ul_kbit}kbit" burst 15k cburst 15k prio 2 quantum 1514
+	fi
+	tc filter add dev "$WAN_IF" parent 1: handle "$fwmark" fw flowid "$class_id"
+
+	# Download no LAN_IF
+	if [ "$dl_kbit" = "0" ]; then
+		tc class add dev "$LAN_IF" parent 1:1 classid "$class_id" htb rate "$wan_speed" ceil "$wan_speed" burst 50k cburst 50k prio 1 quantum 1514
+	else
+		tc class add dev "$LAN_IF" parent 1:1 classid "$class_id" htb rate "${dl_kbit}kbit" ceil "${dl_kbit}kbit" burst 15k cburst 15k prio 2 quantum 1514
+	fi
+	tc filter add dev "$LAN_IF" parent 1: handle "$fwmark" fw flowid "$class_id"
+
+	logger -t captiveportal "  Perfil '$name' (fwmark=$fwmark): DL=${dl_kbit}kbit UL=${ul_kbit}kbit"
+}
+
+_teardown_tc() {
+	command -v tc >/dev/null 2>&1 || return 0
+	tc qdisc del dev "$WAN_IF" root 2>/dev/null || true
+	tc qdisc del dev "$LAN_IF" root 2>/dev/null || true
+	logger -t captiveportal "Classes tc/HTB removidas de WAN e LAN."
+}
+
+_teardown_walled_garden() {
+	rm -f "$DNSMASQ_WHITELIST"
+	/etc/init.d/dnsmasq restart > /dev/null 2>&1 || true
+	if crontab -l 2>/dev/null | grep -q "refresh-whitelist"; then
+		crontab -l 2>/dev/null | grep -v "refresh-whitelist" | crontab -
+	fi
+	logger -t captiveportal "Walled garden removido."
+}
+
+_tune_kernel_performance() {
+	sysctl -w net.netfilter.nf_conntrack_max=32768 >/dev/null 2>&1 || true
+	sysctl -w net.core.netdev_max_backlog=5000      >/dev/null 2>&1 || true
+	sysctl -w net.ipv4.tcp_fastopen=3               >/dev/null 2>&1 || true
+}
+
+_init_sessions_file() {
+	echo '{"sessions":[]}' > "$SESSIONS_FILE"
+}
+
+# ---------------------------------------------------------------------------
+# Daemon Redirecionador HTTP Dedicado (Lua — porta 2080)
+# Responde 302 direto para sondagens de captive portal (Android, iOS, Windows)
+# ---------------------------------------------------------------------------
+_start_redirector() {
+	_stop_redirector
+	local script="/etc/captiveportal/captive_redirector.lua"
+	if [ -f "$script" ]; then
+		chmod 755 "$script" 2>/dev/null || true
+		logger -t captiveportal "Iniciando daemon redirecionador Lua na porta $PORTAL_PORT..."
+		lua "$script" >/dev/null 2>&1 &
+		logger -t captiveportal "Daemon redirecionador Lua iniciado."
+	else
+		logger -t captiveportal "ERRO: $script não encontrado!"
+	fi
+}
+
+_stop_redirector() {
+	if [ -f /var/run/captive_redirector.pid ]; then
+		local rpid=$(cat /var/run/captive_redirector.pid 2>/dev/null)
+		if [ -n "$rpid" ]; then
+			kill "$rpid" 2>/dev/null || true
+		fi
+		rm -f /var/run/captive_redirector.pid
+	fi
+	killall captive_redirector.lua 2>/dev/null || true
+	for p in $(pgrep -f "captive_redirector.lua" 2>/dev/null); do
+		kill -9 "$p" 2>/dev/null || true
+	done
+	logger -t captiveportal "Daemon redirecionador parado."
+}
+
+# ---------------------------------------------------------------------------
+# START (BusyBox rc.common — função start() sem procd)
+# ---------------------------------------------------------------------------
+start() {
+	. /lib/functions.sh
+	_load_config
+	config_load captiveportal
+
+	logger -t captiveportal "Iniciando Portal Captivo 3000 (BE220 port)..."
+
+	_tune_kernel_performance
+	_init_sessions_file
+
+	if ! _apply_ipt_rules; then
+		logger -t captiveportal "ERRO FATAL: regras iptables não aplicadas. Abortando."
+		return 1
+	fi
+
+	_setup_walled_garden
+	_setup_blacklist
+	_setup_tc
+
+	# -------------------------------------------------------------------------
+	# Garante que uhttpd NÃO escute na porta 2080 (a porta 2080 é exclusiva do
+	# captive_redirector.lua, para evitar o redirecionamento forçado de HTTPS do TP-Link)
+	# -------------------------------------------------------------------------
+	if uci -q get uhttpd.main.listen_http | grep -q "2080"; then
+		uci del_list uhttpd.main.listen_http='0.0.0.0:2080' 2>/dev/null || true
+		uci commit uhttpd 2>/dev/null || true
+		/etc/init.d/uhttpd restart >/dev/null 2>&1 || true
+		logger -t captiveportal "uhttpd: porta 2080 desvinculada (reservada para captive_redirector)."
+	fi
+	if uci -q get uhttpd.captive >/dev/null 2>&1; then
+		uci delete uhttpd.captive 2>/dev/null || true
+		uci commit uhttpd 2>/dev/null || true
+	fi
+
+	_start_redirector
+
+	logger -t captiveportal "Portal Captivo 3000 ativo. Sessão timeout: ${SESSION_TIME}s"
+}
+
+
+# ---------------------------------------------------------------------------
+# STOP
+# ---------------------------------------------------------------------------
+stop() {
+	. /lib/functions.sh
+	_load_config
+	config_load captiveportal
+
+	logger -t captiveportal "Parando Portal Captivo 3000..."
+
+	_stop_redirector
+	_remove_ipt_rules
+	_teardown_tc
+	_teardown_walled_garden
+	rm -f "$SESSIONS_FILE"
+
+	logger -t captiveportal "Portal Captivo 3000 parado."
+}
+
+# ---------------------------------------------------------------------------
+# RESTART (preserva sessões ativas — apenas reaplica regras)
+# ---------------------------------------------------------------------------
+restart() {
+	. /lib/functions.sh
+	_load_config
+	config_load captiveportal
+
+	logger -t captiveportal "Recarregando configuração (sessões preservadas)..."
+
+	_teardown_walled_garden
+	_setup_walled_garden
+	_setup_blacklist
+	_teardown_tc
+	_setup_tc
+	_start_redirector
+
+	logger -t captiveportal "Configuração recarregada."
+}
+
+setup_tc() {
+	. /lib/functions.sh
+	_load_config
+	config_load captiveportal
+	_setup_tc
+}
+
+teardown_tc() {
+	. /lib/functions.sh
+	_load_config
+	config_load captiveportal
+	_teardown_tc
+}

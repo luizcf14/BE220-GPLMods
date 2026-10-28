@@ -1,0 +1,140 @@
+#!/bin/sh /etc/rc.common
+# ============================================================================
+# Conexão Povos da Floresta — Serviço do Agente de Nuvem (Archer BE220)
+# ============================================================================
+
+START=96
+STOP=10
+
+PROG=/usr/bin/floresta_agent.lua
+PIDFILE=/var/run/floresta_agent.pid
+
+start() {
+	# Restaura configuração do /data para o /etc/config se necessário (ramfs / após loadconfig)
+	if [ ! -f /etc/config/floresta_cloud ]; then
+		if [ -f /data/etc/config/floresta_cloud ]; then
+			cp -f /data/etc/config/floresta_cloud /etc/config/floresta_cloud 2>/dev/null || true
+		elif [ -f /user_data1/etc/config/floresta_cloud ]; then
+			cp -f /user_data1/etc/config/floresta_cloud /etc/config/floresta_cloud 2>/dev/null || true
+		elif [ -f /etc/captiveportal/floresta_cloud.default ]; then
+			cp -f /etc/captiveportal/floresta_cloud.default /etc/config/floresta_cloud 2>/dev/null || true
+			mkdir -p /data/etc/config /user_data1/etc/config 2>/dev/null || true
+			cp -f /etc/config/floresta_cloud /data/etc/config/floresta_cloud 2>/dev/null || true
+			cp -f /etc/config/floresta_cloud /user_data1/etc/config/floresta_cloud 2>/dev/null || true
+		elif [ -f /rom/etc/config/floresta_cloud ]; then
+			cp -f /rom/etc/config/floresta_cloud /etc/config/floresta_cloud 2>/dev/null || true
+			mkdir -p /data/etc/config /user_data1/etc/config 2>/dev/null || true
+			cp -f /etc/config/floresta_cloud /data/etc/config/floresta_cloud 2>/dev/null || true
+			cp -f /etc/config/floresta_cloud /user_data1/etc/config/floresta_cloud 2>/dev/null || true
+		fi
+	fi
+
+	# Garante também que /etc/config/captiveportal tenha os perfis de QoS caso loadconfig tenha apagado /etc/config
+	if [ ! -s /etc/config/captiveportal ] || ! grep -q "config profile" /etc/config/captiveportal 2>/dev/null; then
+		if [ -s /data/captiveportal/captiveportal ] && grep -q "config profile" /data/captiveportal/captiveportal 2>/dev/null; then
+			cp -f /data/captiveportal/captiveportal /etc/config/captiveportal 2>/dev/null || true
+		elif [ -s /user_data1/captiveportal/captiveportal ] && grep -q "config profile" /user_data1/captiveportal/captiveportal 2>/dev/null; then
+			cp -f /user_data1/captiveportal/captiveportal /etc/config/captiveportal 2>/dev/null || true
+		elif [ -s /etc/captiveportal/captiveportal.default ]; then
+			cp -f /etc/captiveportal/captiveportal.default /etc/config/captiveportal 2>/dev/null || true
+		elif [ -s /rom/etc/config/captiveportal ]; then
+			cp -f /rom/etc/config/captiveportal /etc/config/captiveportal 2>/dev/null || true
+		fi
+	fi
+
+	# Garante versão 77.0.1 Build 20991231 rel.99999 na partição NVRAM soft-version e bloqueia OTA oficial TP-Link
+	if ! /sbin/getfirm SOFTVERSION 2>/dev/null | grep -q "^77\.0\.1"; then
+		printf 'soft_ver:77.0.1 Build 20991231 rel.99999\nfw_id:2201DC33F42936D3DC3E01E2D05EA6E2\n\n' > /tmp/.floresta_sv
+		/usr/bin/nvrammanager -e -p soft-version >/dev/null 2>&1 || true
+		/usr/bin/nvrammanager -w /tmp/.floresta_sv -p soft-version >/dev/null 2>&1 || true
+		rm -f /tmp/.floresta_sv /tmp/softversion 2>/dev/null || true
+	fi
+	if uci -q get cloud_config.upgrade_info >/dev/null 2>&1 || [ "$(uci -q get cloud_config.new_firmware.fw_new_notify 2>/dev/null)" = "1" ]; then
+		uci -q delete cloud_config.upgrade_info 2>/dev/null || true
+		uci -q set cloud_config.new_firmware.fw_new_notify='0' 2>/dev/null || true
+		uci -q set cloud_config.new_firmware.cloud_push='0' 2>/dev/null || true
+		uci -q set cloud_config.device_status.need_checkupgrade='0' 2>/dev/null || true
+		uci -q commit cloud_config 2>/dev/null || true
+		uci -q set auto_upgrade.upgrade.enable='off' 2>/dev/null || true
+		uci -q commit auto_upgrade 2>/dev/null || true
+	fi
+
+	local enabled=1
+	if [ -f /etc/config/floresta_cloud ]; then
+		config_load floresta_cloud
+		config_get_bool enabled global enabled 1
+	fi
+
+	[ "$enabled" -eq 1 ] || return 0
+
+	local AGENT_BIN="$PROG"
+	if [ -f /data/floresta_agent.lua ]; then
+		# Se existir floresta_agent.lua em /data e o firmware em /usr/bin tiver sido atualizado
+		# ou o arquivo em /data estiver truncado/corrompido, sincroniza a partir de $PROG
+		local fw_md5=$(md5sum "$PROG" 2>/dev/null | cut -d' ' -f1)
+		local saved_md5=$(cat /data/.fw_agent_md5 2>/dev/null)
+		if [ ! -s /data/floresta_agent.lua ] || ! tail -n 5 /data/floresta_agent.lua 2>/dev/null | grep -q "^end" || { [ -n "$fw_md5" ] && [ "$fw_md5" != "$saved_md5" ]; }; then
+			cp -f "$PROG" /data/floresta_agent.lua 2>/dev/null || true
+			echo "$fw_md5" > /data/.fw_agent_md5 2>/dev/null || true
+		fi
+		AGENT_BIN="/data/floresta_agent.lua"
+	elif [ -f /user_data1/floresta_agent.lua ]; then
+		local fw_md5=$(md5sum "$PROG" 2>/dev/null | cut -d' ' -f1)
+		local saved_md5=$(cat /user_data1/.fw_agent_md5 2>/dev/null)
+		if [ ! -s /user_data1/floresta_agent.lua ] || ! tail -n 5 /user_data1/floresta_agent.lua 2>/dev/null | grep -q "^end" || { [ -n "$fw_md5" ] && [ "$fw_md5" != "$saved_md5" ]; }; then
+			cp -f "$PROG" /user_data1/floresta_agent.lua 2>/dev/null || true
+			echo "$fw_md5" > /user_data1/.fw_agent_md5 2>/dev/null || true
+		fi
+		AGENT_BIN="/user_data1/floresta_agent.lua"
+	fi
+
+	if [ ! -f "$AGENT_BIN" ]; then
+		return 1
+	fi
+
+	# Garante inicialização do bloqueio DNS (DNS sinkhole)
+	if [ -f /data/etc/dns_blocklist.conf ]; then
+		cp -f /data/etc/dns_blocklist.conf /tmp/dns_blocklist.conf 2>/dev/null || true
+	else
+		touch /tmp/dns_blocklist.conf
+	fi
+	if ! grep -q "dns_blocklist.conf" /etc/dnsmasq.conf 2>/dev/null; then
+		echo "conf-file=/tmp/dns_blocklist.conf" >> /etc/dnsmasq.conf
+		for p in $(pgrep -f dnsproxy_deamon.sh 2>/dev/null); do kill -9 "$p" 2>/dev/null || true; done
+		/etc/init.d/dnsmasq restart 2>/dev/null || true
+	fi
+
+	lock /var/run/floresta_agent.lock 2>/dev/null || true
+
+	# Mata watchdogs e instâncias antigas se houver
+	if [ -f "$PIDFILE" ]; then
+		kill -9 $(cat "$PIDFILE" 2>/dev/null) 2>/dev/null || true
+		rm -f "$PIDFILE" 2>/dev/null || true
+	fi
+	for pid in $(pgrep -f floresta_agent.lua 2>/dev/null); do
+		[ "$pid" != "$$" ] && kill -9 "$pid" 2>/dev/null || true
+	done
+
+	# Inicia o agente em background com auto-respawn imortal
+	(
+		trap '' PIPE
+		while true; do
+			/usr/bin/lua "$AGENT_BIN" >/var/log/floresta_agent.log 2>&1
+			sleep 3
+		done
+	) &
+	echo $! > "$PIDFILE"
+
+	lock -u /var/run/floresta_agent.lock 2>/dev/null || true
+}
+
+stop() {
+	if [ -f "$PIDFILE" ]; then
+		kill -9 $(cat "$PIDFILE" 2>/dev/null) 2>/dev/null || true
+		rm -f "$PIDFILE" 2>/dev/null || true
+	fi
+	for pid in $(pgrep -f floresta_agent.lua 2>/dev/null); do
+		[ "$pid" != "$$" ] && kill -9 "$pid" 2>/dev/null || true
+	done
+}
+

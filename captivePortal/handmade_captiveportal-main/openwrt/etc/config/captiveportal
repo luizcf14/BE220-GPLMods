@@ -1,0 +1,99 @@
+# Portal Captivo 3000 — Configuração UCI
+# /etc/config/captiveportal
+#
+# Editável via LuCI (Services → Captive Portal) ou linha de comando:
+#   uci set captiveportal.global.session_time=7200
+#   uci commit captiveportal
+#   service captiveportal restart
+
+config captiveportal 'global'
+	# Habilitar Controle de Banda (QoS / tc) — 1 = ativo, 0 = desativado (economiza CPU)
+	option enable_qos     '1'
+	# Velocidade real da WAN (ex: 800mbit, 1gbit)
+	option wan_speed      '800mbit'
+	# URL base do backend REST Laravel
+	option api_url        'https://apidev.conexaopovosdafloresta.org.br'
+	# Endpoint de validação de token (GET com Authorization: Bearer <token>)
+	option api_user_path  '/api/user/me'
+	# Duração de sessão em segundos (3600 = 1 hora)
+	option session_time   '3600'
+	# Interface WAN para aplicar QoS (auto-detectada se ausente: eth0, eth0.2, wan, etc)
+	option wan_interface  'eth0'
+	# Interface LAN (bridge)
+	option lan_interface  'br-lan'
+	# IP do roteador (sempre liberado no walled garden)
+	option router_ip      '192.168.1.1'
+	# Domínio local do roteador
+	option router_domain  'roteador.conexaopovosdafloresta.org.br'
+	# Porta interna do portal redirect (uhttpd escuta nessa porta também)
+	option portal_port    '2080'
+
+# -------------------------------------------------------------------------
+# Walled Garden — Domínios liberados ANTES do login
+# Adicione/remova entradas 'list domain' livremente.
+# Suporte a wildcard: *.exemplo.com libera todos os subdomínios.
+# O roteador (router_ip acima) é sempre liberado implicitamente.
+# -------------------------------------------------------------------------
+config captiveportal 'walled_garden'
+	list domain 'apidev.conexaopovosdafloresta.org.br'
+	list domain 'conexaopovosdafloresta.org.br'
+	list domain 'paineldecontrole-dev.conexaopovosdafloresta.org.br'
+	list domain 'roteador.conexaopovosdafloresta.org.br'
+	list domain '*.conexaopovosdafloresta.org.br'
+
+# -------------------------------------------------------------------------
+# Blacklist DNS — Bloqueio de Conteúdo Indesejado
+# Redireciona a consulta DNS do domínio para o IP do roteador (router_ip)
+# exibindo a página "Este site foi bloqueado pelo administrador".
+# -------------------------------------------------------------------------
+config captiveportal 'blacklist'
+	option enabled        '1'
+	option community_url  'https://raw.githubusercontent.com/StevenBlack/hosts/master/alternates/porn/hosts'
+	list domain 'siteindesejado.com'
+
+# -------------------------------------------------------------------------
+# Perfis de Velocidade
+# name    : valor EXATO de user.role.name retornado pelo backend Laravel
+# fwmark  : número interno único por perfil (NÃO altere após usuários logarem)
+# dl_kbit : limite de download em Kbps (0 = sem limite)
+# ul_kbit : limite de upload em Kbps (0 = sem limite)
+#
+# Para adicionar um perfil: copie um bloco, ajuste name/fwmark/velocidades
+# e rode: service captiveportal restart
+# -------------------------------------------------------------------------
+
+config profile 'visitante'
+	option name     'Visitante'
+	option fwmark   '1'
+	option dl_kbit  '2048'
+	option ul_kbit  '1024'
+
+config profile 'jovem'
+	option name     'Jovem'
+	option fwmark   '2'
+	option dl_kbit  '4096'
+	option ul_kbit  '2048'
+
+config profile 'comunitario'
+	option name     'Comunitario'
+	option fwmark   '3'
+	option dl_kbit  '5120'
+	option ul_kbit  '2048'
+
+config profile 'medico'
+	option name     'Médico'
+	option fwmark   '4'
+	option dl_kbit  '10240'
+	option ul_kbit  '5120'
+
+config profile 'administrador'
+	option name     'Administrador'
+	option fwmark   '5'
+	option dl_kbit  '25600'
+	option ul_kbit  '10240'
+
+config profile 'ilimitado'
+	option name     'Ilimitado'
+	option fwmark   '6'
+	option dl_kbit  '0'
+	option ul_kbit  '0'

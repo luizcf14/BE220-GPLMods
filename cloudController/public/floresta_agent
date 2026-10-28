@@ -1,0 +1,85 @@
+#!/bin/sh /etc/rc.common
+# ============================================================================
+# Conexão Povos da Floresta — Serviço do Agente de Nuvem (Archer BE220)
+# ============================================================================
+
+START=96
+STOP=10
+
+PROG=/usr/bin/floresta_agent.lua
+PIDFILE=/var/run/floresta_agent.pid
+
+start() {
+	# Restaura configuração do /data para o /etc/config se necessário (ramfs)
+	if [ ! -f /etc/config/floresta_cloud ]; then
+		if [ -f /data/etc/config/floresta_cloud ]; then
+			cp -f /data/etc/config/floresta_cloud /etc/config/floresta_cloud 2>/dev/null || true
+		elif [ -f /user_data1/etc/config/floresta_cloud ]; then
+			cp -f /user_data1/etc/config/floresta_cloud /etc/config/floresta_cloud 2>/dev/null || true
+		fi
+	fi
+
+	local enabled=1
+	if [ -f /etc/config/floresta_cloud ]; then
+		config_load floresta_cloud
+		config_get_bool enabled global enabled 1
+	fi
+
+	[ "$enabled" -eq 1 ] || return 0
+
+	local AGENT_BIN="$PROG"
+	if [ -f /data/floresta_agent.lua ]; then
+		# Se existir floresta_agent.lua em /data e o firmware em /usr/bin tiver sido atualizado,
+		# sincroniza para que a versão do novo firmware prevaleça
+		local fw_md5=$(md5sum "$PROG" 2>/dev/null | cut -d' ' -f1)
+		local saved_md5=$(cat /data/.fw_agent_md5 2>/dev/null)
+		if [ -n "$fw_md5" ] && [ "$fw_md5" != "$saved_md5" ]; then
+			cp -f "$PROG" /data/floresta_agent.lua 2>/dev/null || true
+			echo "$fw_md5" > /data/.fw_agent_md5 2>/dev/null || true
+		fi
+		AGENT_BIN="/data/floresta_agent.lua"
+	elif [ -f /user_data1/floresta_agent.lua ]; then
+		local fw_md5=$(md5sum "$PROG" 2>/dev/null | cut -d' ' -f1)
+		local saved_md5=$(cat /user_data1/.fw_agent_md5 2>/dev/null)
+		if [ -n "$fw_md5" ] && [ "$fw_md5" != "$saved_md5" ]; then
+			cp -f "$PROG" /user_data1/floresta_agent.lua 2>/dev/null || true
+			echo "$fw_md5" > /user_data1/.fw_agent_md5 2>/dev/null || true
+		fi
+		AGENT_BIN="/user_data1/floresta_agent.lua"
+	fi
+
+	if [ ! -f "$AGENT_BIN" ]; then
+		return 1
+	fi
+
+	# Garante inicialização do bloqueio DNS (DNS sinkhole)
+	if [ -f /data/etc/dns_blocklist.conf ]; then
+		cp -f /data/etc/dns_blocklist.conf /tmp/dns_blocklist.conf 2>/dev/null || true
+	else
+		touch /tmp/dns_blocklist.conf
+	fi
+	if ! grep -q "dns_blocklist.conf" /etc/dnsmasq.conf 2>/dev/null; then
+		echo "conf-file=/tmp/dns_blocklist.conf" >> /etc/dnsmasq.conf
+		/etc/init.d/dnsmasq reload 2>/dev/null || /etc/init.d/dnsmasq restart 2>/dev/null || true
+	fi
+
+	# Mata instâncias antigas se houver
+	for pid in $(pgrep -f floresta_agent.lua 2>/dev/null); do
+		[ "$pid" != "$$" ] && kill -9 "$pid" 2>/dev/null || true
+	done
+
+	# Inicia o agente em background
+	/usr/bin/lua "$AGENT_BIN" >/var/log/floresta_agent.log 2>&1 &
+	echo $! > "$PIDFILE"
+}
+
+stop() {
+	if [ -f "$PIDFILE" ]; then
+		kill -9 $(cat "$PIDFILE" 2>/dev/null) 2>/dev/null || true
+		rm -f "$PIDFILE" 2>/dev/null || true
+	fi
+	for pid in $(pgrep -f floresta_agent.lua 2>/dev/null); do
+		[ "$pid" != "$$" ] && kill -9 "$pid" 2>/dev/null || true
+	done
+}
+

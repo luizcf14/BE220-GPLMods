@@ -1,0 +1,35 @@
+{
+	"luci-app-captiveportal": {
+		"description": "Portal Captivo 3000 - ACL de acesso",
+		"read": {
+			"uci": [ "captiveportal", "dhcp", "uhttpd" ],
+			"ubus": {
+				"captiveportal": [ "sessions", "status" ],
+				"service": [ "list" ],
+				"uci": [ "get" ]
+			},
+			"file": {
+				"/tmp/captiveportal_sessions.json": [ "read" ],
+				"/etc/captiveportal/*": [ "read" ]
+			}
+		},
+		"write": {
+			"uci": [ "captiveportal", "dhcp", "uhttpd" ],
+			"ubus": {
+				"captiveportal": [ "kick", "flush", "reload" ],
+				"service": [ "start", "stop", "restart", "reload", "list" ],
+				"uci": [ "get", "set", "add", "delete", "commit", "apply" ],
+				"luci": [ "setPassword" ]
+			},
+			"file": {
+				"/tmp/captiveportal_sessions.json": [ "read", "write" ],
+				"/etc/captiveportal/*": [ "read", "write" ],
+				"/usr/bin/portal_ctl": [ "exec" ],
+				"/etc/init.d/captiveportal": [ "exec" ],
+				"/etc/init.d/dnsmasq": [ "exec" ],
+				"/etc/init.d/uhttpd": [ "exec" ],
+				"/etc/init.d/firewall": [ "exec" ]
+			}
+		}
+	}
+}

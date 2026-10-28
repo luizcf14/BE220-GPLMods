@@ -1,0 +1,513 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Povos da Floresta — Cloud Controller</title>
+  <link rel="stylesheet" href="/dashboard/style.css?v=20261027_01">
+  <!-- Fonts -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+  <!-- xterm.js Local para Web Terminal 100% Offline -->
+  <link rel="stylesheet" href="/dashboard/vendor/xterm.css" />
+  <script src="/dashboard/vendor/xterm.js"></script>
+  <script src="/dashboard/vendor/xterm-addon-fit.js"></script>
+</head>
+<body>
+
+  <!-- Topbar -->
+  <header class="topbar">
+    <div class="brand">
+      <div class="brand-icon">🌲</div>
+      <div>
+        <div class="brand-title">
+          <span>Povos da Floresta</span>
+          <span class="brand-badge">Cloud Controller</span>
+        </div>
+        <div class="brand-subtitle">Gestão Remota de Roteadores Archer BE220 (Sem VPN)</div>
+      </div>
+    </div>
+    <div class="topbar-right">
+      <button class="btn" style="background:rgba(124, 58, 237, 0.15); border:1px solid rgba(124, 58, 237, 0.4); color:#c4b5fd; font-weight:600;" onclick="openDefaultDnsModal()">
+        🛡️ Lista Padrão de Bloqueio DNS
+      </button>
+      <div class="ws-status-badge" id="ws-badge">
+        <span class="ws-dot"></span>
+        <span id="ws-status-text">Conectando...</span>
+      </div>
+      <div class="user-menu">
+        <button class="user-chip" id="user-chip" onclick="toggleUserMenu(event)" title="Conta e sessão">
+          <span class="user-avatar" id="user-avatar">?</span>
+          <span class="user-info"><span class="user-name" id="user-name">—</span><small id="user-role">—</small></span>
+          <span class="user-caret">▾</span>
+        </button>
+        <div class="user-dropdown" id="user-dropdown" onclick="event.stopPropagation()">
+          <button id="menu-users" style="display:none;" onclick="openUsersModal()">👥 Gerenciar usuários</button>
+          <button onclick="openChangePasswordModal()">🔑 Alterar senha</button>
+          <button class="danger" onclick="logout()">🚪 Sair</button>
+        </div>
+      </div>
+    </div>
+  </header>
+
+  <div class="container">
+    <!-- Métricas Globais -->
+    <div class="stats-grid">
+      <div class="stat-card">
+        <div class="stat-label">
+          <span>Roteadores Conectados</span>
+          <span>📡</span>
+        </div>
+        <div class="stat-val" id="stat-routers-online" style="color:var(--accent-cyan);">0</div>
+        <div class="stat-sub" id="stat-routers-total">Nenhum dispositivo na frota</div>
+      </div>
+
+      <div class="stat-card">
+        <div class="stat-label">
+          <span>Pessoas Online Agora</span>
+          <span>👥</span>
+        </div>
+        <div class="stat-val" id="stat-users-online" style="color:var(--accent-emerald);">0</div>
+        <div class="stat-sub">Sessões autenticadas no Portal</div>
+      </div>
+
+      <div class="stat-card">
+        <div class="stat-label">
+          <span>Enlace Satelital / WAN</span>
+          <span>🛰️</span>
+        </div>
+        <div class="stat-val" id="stat-starlink" style="color:var(--text-main); font-size:22px; margin-top:12px;">Starlink / 4G</div>
+        <div class="stat-sub">Tráfego via WebSockets Outbound</div>
+      </div>
+
+      <div class="stat-card">
+        <div class="stat-label">
+          <span>Controle QoS Global</span>
+          <span>⚡</span>
+        </div>
+        <div class="stat-val" id="stat-qos-global" style="color:var(--accent-amber); font-size:22px; margin-top:12px;">Automático</div>
+        <div class="stat-sub">Limitação por perfil de aldeia</div>
+      </div>
+    </div>
+
+    <!-- SEÇÃO DE DISPOSITIVOS PENDENTES DE ADOÇÃO (ESTILO UNIFI) -->
+    <div id="pending-adoption-section" style="display:none; margin-bottom: 28px;">
+      <div class="section-header">
+        <div class="section-title" style="color:var(--accent-amber);">
+          <span>🔔 Novos Roteadores Aguardando Adoção</span>
+          <span class="brand-badge" id="pending-count" style="background:rgba(245,158,11,0.2); color:#fbbf24; border-color:#f59e0b40;">0 Pendente</span>
+        </div>
+      </div>
+      <div id="pending-list"></div>
+    </div>
+
+    <!-- Lista de Roteadores -->
+    <div class="section-header">
+      <div class="section-title">
+        <span>Frota Ativa de Roteadores da Floresta</span>
+        <span class="brand-badge" id="fleet-count">0 Dispositivos</span>
+      </div>
+      <div>
+        <button class="btn btn-primary" onclick="connectAdminWs()">🔄 Atualizar Frota</button>
+      </div>
+    </div>
+
+    <!-- Container dos Cards de Roteadores -->
+    <div id="routers-list">
+      <div class="empty-state">
+        <div class="empty-state-icon">📡</div>
+        <h3 style="margin-bottom:6px; color:#f8fafc;">Nenhum Roteador Adotado</h3>
+        <p>Dispositivos que se conectarem pela primeira vez aparecerão na seção "Aguardando Adoção" acima.</p>
+      </div>
+    </div>
+  </div>
+
+  <!-- MODAL DO TERMINAL WEB (SSH AO VIVO) -->
+  <div class="modal-backdrop" id="modal-terminal">
+    <div class="modal-container" style="max-width: 950px;">
+      <div class="modal-header">
+        <div class="modal-title">
+          <span>>_ Console Remoto (Web SSH) —</span>
+          <span id="term-device-name" style="font-family:var(--font-mono); color:var(--accent-cyan);">root@BE220</span>
+        </div>
+        <button class="modal-close" onclick="closeTerminal()">&times;</button>
+      </div>
+      <div style="background:#0a0d14; padding:8px 16px; font-size:12px; color:var(--text-muted); display:flex; justify-content:space-between; align-items:center; border-bottom:1px solid var(--border-color);">
+        <span>Sessão direta de PTY (/bin/ash) tunelada via WebSocket seguro</span>
+        <div style="display:flex; align-items:center; gap:12px;">
+          <input type="file" id="term-file-input" style="display:none;" onchange="handleFileSelected(event)">
+          <button class="btn btn-secondary" id="btn-term-upload" style="padding:3px 10px; font-size:11px; display:inline-flex; align-items:center; gap:6px; border-color:rgba(0, 210, 255, 0.4); color:var(--accent-cyan);" onclick="triggerFileUpload()" title="Fazer upload de arquivo diretamente para o /tmp do roteador (Arrastar e soltar também suportado)">
+            <span>📁 Enviar Arquivo para /tmp</span>
+          </button>
+          <span style="color:var(--accent-emerald);">● Conexão Ativa</span>
+        </div>
+      </div>
+      <!-- Painel de progresso de upload -->
+      <div id="term-upload-panel">
+        <div class="term-upload-info">
+          <div class="term-upload-filename">
+            <span>📤</span>
+            <span id="term-upload-name">arquivo.bin</span>
+            <span id="term-upload-stats" class="term-upload-stats">0 / 0 MB</span>
+          </div>
+          <div style="display:flex; align-items:center; gap:10px;">
+            <span id="term-upload-percent" style="font-weight:700; color:#00f2fe;">0%</span>
+            <button class="btn btn-secondary" style="padding:1px 6px; font-size:10px; border-color:#ef4444; color:#ef4444;" onclick="cancelFileUpload(true)" title="Cancelar envio">✕ Cancelar</button>
+          </div>
+        </div>
+        <div class="term-upload-progress-track">
+          <div id="term-upload-bar" class="term-upload-progress-fill"></div>
+        </div>
+      </div>
+      <div class="modal-body" style="padding:10px; background:#000;">
+        <div id="terminal-view"></div>
+        <div style="display:flex; gap:6px; flex-wrap:wrap; margin-top:8px; align-items:center; background:#0a0d14; padding:6px 10px; border-radius:6px; border:1px solid #1f2937;">
+          <span style="font-size:11px; font-weight:600; color:var(--text-muted); font-family:var(--font-mono); margin-right:4px;">Atalhos:</span>
+          <button class="btn btn-secondary" style="padding:2px 8px; font-size:11px; font-family:var(--font-mono); border-color:#374151;" onclick="sendTerminalKey('^C')" title="Cancelar comando / SIGINT (Ctrl+C)">Ctrl+C</button>
+          <button class="btn btn-secondary" style="padding:2px 8px; font-size:11px; font-family:var(--font-mono); border-color:#374151;" onclick="sendTerminalKey('^D')" title="Sair / EOF (Ctrl+D)">Ctrl+D</button>
+          <button class="btn btn-secondary" style="padding:2px 8px; font-size:11px; font-family:var(--font-mono); border-color:#374151;" onclick="sendTerminalKey('^A')" title="Início da linha (Ctrl+A)">Ctrl+A</button>
+          <button class="btn btn-secondary" style="padding:2px 8px; font-size:11px; font-family:var(--font-mono); border-color:#374151;" onclick="sendTerminalKey('^W')" title="Apagar palavra anterior / Buscar no nano (Ctrl+W)">Ctrl+W</button>
+          <button class="btn btn-secondary" style="padding:2px 8px; font-size:11px; font-family:var(--font-mono); border-color:#374151;" onclick="sendTerminalKey('^L')" title="Limpar tela (Ctrl+L)">Ctrl+L</button>
+          <button class="btn btn-secondary" style="padding:2px 8px; font-size:11px; font-family:var(--font-mono); border-color:#374151;" onclick="sendTerminalKey('^U')" title="Limpar linha (Ctrl+U)">Ctrl+U</button>
+          <button class="btn btn-secondary" style="padding:2px 8px; font-size:11px; font-family:var(--font-mono); border-color:#374151;" onclick="sendTerminalKey('TAB')" title="Autocompletar (Tab)">Tab</button>
+          <button class="btn btn-secondary" style="padding:2px 8px; font-size:11px; font-family:var(--font-mono); border-color:#374151;" onclick="sendTerminalKey('ESC')" title="Escape / Modo Comando do vi (ESC)">ESC</button>
+        </div>
+        <div style="display:flex; gap:8px; margin-top:8px; background:#111827; padding:8px 12px; border-radius:6px; border:1px solid #1f2937;">
+          <span style="font-family:var(--font-mono); font-size:13px; color:var(--accent-cyan); display:flex; align-items:center;">root@BE220#</span>
+          <input type="text" id="term-input-field" placeholder="Digite um comando (ex: uptime, htop, ifconfig) e tecle Enter..." style="flex:1; background:transparent; border:none; color:#f8fafc; font-family:var(--font-mono); font-size:13px; outline:none;" onkeydown="handleTerminalKey(event)">
+          <button class="btn btn-primary" style="padding:4px 12px; font-size:12px;" onclick="sendTerminalLine()">Enviar</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- MODAL DE CLIENTES CONECTADOS -->
+  <div class="modal-backdrop" id="modal-clients">
+    <div class="modal-container" style="max-width: 750px;">
+      <div class="modal-header">
+        <div class="modal-title">
+          <span>👥 Clientes Conectados —</span>
+          <span id="clients-router-name" style="color:var(--accent-cyan);">Roteador</span>
+        </div>
+        <button class="modal-close" onclick="closeClientsModal()">&times;</button>
+      </div>
+      <div class="modal-body">
+        <div id="clients-table-container">Carregando...</div>
+      </div>
+    </div>
+  </div><!-- end modal-backdrop#modal-clients -->
+
+  <!-- MODAL DO TÚNEL WEBUI REMOTA (TP-LINK OFICIAL) -->
+  <div class="modal-backdrop" id="modal-tunnel">
+    <div class="modal-container" style="max-width: 600px;">
+      <div class="modal-header">
+        <div class="modal-title">
+          <span>🌐 Acesso Remoto à WebUI TP-Link —</span>
+          <span id="tunnel-router-name" style="color:var(--accent-cyan);">Roteador</span>
+        </div>
+        <button class="modal-close" onclick="closeTunnelModal()">&times;</button>
+      </div>
+      <div class="modal-body" style="padding:20px;">
+        <div id="tunnel-status-loading" style="text-align:center; padding:20px;">
+          <div style="font-size:32px; margin-bottom:12px;">⏳</div>
+          <div style="font-size:15px; font-weight:600; color:#f8fafc;">Estabelecendo Túnel TCP Reverso...</div>
+          <div style="font-size:12px; color:var(--text-muted); margin-top:6px;">Conectando à porta 80 do roteador via canal seguro WebSocket</div>
+        </div>
+        <div id="tunnel-status-ready" style="display:none; text-align:center; padding:10px 0;">
+          <div style="font-size:38px; margin-bottom:12px;">🚀</div>
+          <div style="font-size:16px; font-weight:600; color:var(--accent-emerald); margin-bottom:8px;">Túnel TCP Ativo com Sucesso!</div>
+          <p style="font-size:13px; color:var(--text-muted); margin-bottom:18px; line-height:1.5;">
+            A interface de gerenciamento oficial da TP-Link está mapeada e acessível via <strong id="tunnel-port-badge" style="color:#38bdf8;">HTTPS</strong>.<br>
+            Nenhuma VPN necessária. O tráfego passa 100% pelo WebSocket seguro do Cloud Controller.
+          </p>
+          <div style="display:flex; justify-content:center; gap:12px; margin-top:10px;">
+            <a id="tunnel-open-btn" href="#" target="_blank" class="btn btn-primary" style="padding:10px 20px; font-size:14px; text-decoration:none; display:inline-flex; align-items:center; gap:6px;">
+              ↗️ Abrir Painel TP-Link em Nova Aba
+            </a>
+            <button class="btn btn-danger" style="padding:10px 16px; font-size:14px;" onclick="terminateCurrentTunnel()">
+              ⏹ Encerrar Túnel
+            </button>
+          </div>
+        </div>
+        <div id="tunnel-status-error" style="display:none; text-align:center; padding:20px;">
+          <div style="font-size:32px; margin-bottom:12px;">❌</div>
+          <div style="font-size:15px; font-weight:600; color:#f43f5e;" id="tunnel-error-msg">Falha ao iniciar túnel.</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- MODAL DE LISTA PADRÃO GLOBAL DE BLOQUEIO DNS -->
+  <div class="modal-backdrop" id="modal-default-dns">
+    <div class="modal-container" style="max-width: 780px;">
+      <div class="modal-header">
+        <div class="modal-title">
+          <span>🛡️ Lista Padrão Global de Bloqueio DNS</span>
+          <span class="dns-counter-badge" id="default-dns-count">0 domínios</span>
+        </div>
+        <button class="modal-close" onclick="closeDefaultDnsModal()">&times;</button>
+      </div>
+      <div class="modal-body">
+        <div class="dns-alert dns-alert-info">
+          <div style="font-size: 18px;">ℹ️</div>
+          <div>
+            <strong>Modelo Central de Bloqueio da Nuvem</strong><br>
+            Esta lista serve como catálogo padrão (ex: sites de apostas, bets e conteúdos nocivos). Você pode importá-la com 1 clique para qualquer roteador da frota. Domínios protegidos da <em>Whitelist do Portal Captivo</em> nunca serão bloqueados.
+          </div>
+        </div>
+
+        <div class="dns-input-group">
+          <input type="text" id="default-dns-input" class="dns-input" placeholder="Digite um domínio (ex: bet365.com ou blaze.com) e tecle Enter..." onkeydown="handleDefaultDnsInput(event)">
+          <button class="btn btn-primary" onclick="addDefaultDnsDomain()">+ Adicionar</button>
+        </div>
+
+        <div class="dns-toolbar">
+          <div style="display:flex; align-items:center; gap:8px;">
+            <input type="text" id="default-dns-search" class="dns-input" placeholder="🔍 Filtrar domínios..." style="padding:5px 10px; font-size:12px; width:200px;" oninput="filterDefaultDnsList(this.value)">
+            <span style="font-size:12px; color:var(--text-muted);" id="default-dns-filter-count"></span>
+          </div>
+          <div style="display:flex; gap:8px;">
+            <button class="btn" style="font-size:12px;" onclick="resetDefaultDnsToRecommended()">📋 Restaurar Recomendados</button>
+            <button class="btn btn-danger" style="font-size:12px;" onclick="clearAllDefaultDns()">🗑️ Limpar Todos</button>
+          </div>
+        </div>
+
+        <div class="dns-tag-container" id="default-dns-tags">
+          <!-- Renderizado via JS -->
+        </div>
+
+        <div style="margin-top:20px; display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px;">
+          <button class="btn" style="background:rgba(245,158,11,0.15); border:1px solid rgba(245,158,11,0.4); color:#fbbf24;" onclick="applyDefaultDnsToAllRouters()">
+            ⚡ Aplicar Lista Padrão em Todos os Roteadores Adotados
+          </button>
+          <div style="display:flex; gap:8px;">
+            <button class="btn" onclick="closeDefaultDnsModal()">Fechar</button>
+            <button class="btn btn-primary" onclick="saveDefaultDnsList()">💾 Salvar Lista Padrão</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- MODAL DE BLOQUEIO DNS INDIVIDUAL POR ROTEADOR -->
+  <div class="modal-backdrop" id="modal-router-dns">
+    <div class="modal-container" style="max-width: 780px;">
+      <div class="modal-header">
+        <div class="modal-title">
+          <span>🛡️ Bloqueio de URLs (DNS) —</span>
+          <span id="router-dns-device-name" style="color:var(--accent-cyan);">Roteador</span>
+          <span class="dns-counter-badge" id="router-dns-count">0 domínios</span>
+        </div>
+        <button class="modal-close" onclick="closeRouterDnsModal()">&times;</button>
+      </div>
+      <div class="modal-body">
+        <div class="dns-alert dns-alert-info">
+          <div style="font-size: 18px;">💡</div>
+          <div>
+            <strong>Bloqueio Nativo via DNS Sinkhole (<code style="color:#38bdf8;">0.0.0.0</code>)</strong><br>
+            Ao aplicar, o roteador redireciona o domínio e todos os subdomínios em 0ms. A recarga é instantânea (&lt; 5ms) sem reiniciar e sem derrubar os clientes conectados.
+          </div>
+        </div>
+
+        <div id="router-dns-status-box" style="display:none; margin-bottom:16px;"></div>
+
+        <div class="dns-input-group">
+          <input type="text" id="router-dns-input" class="dns-input" placeholder="Adicionar domínio específico para este roteador (ex: cassino.bet)..." onkeydown="handleRouterDnsInput(event)">
+          <button class="btn btn-primary" onclick="addRouterDnsDomain()">+ Adicionar</button>
+        </div>
+
+        <div class="dns-toolbar">
+          <div style="display:flex; align-items:center; gap:8px;">
+            <input type="text" id="router-dns-search" class="dns-input" placeholder="🔍 Filtrar domínios..." style="padding:5px 10px; font-size:12px; width:200px;" oninput="filterRouterDnsList(this.value)">
+            <span style="font-size:12px; color:var(--text-muted);" id="router-dns-filter-count"></span>
+          </div>
+          <div style="display:flex; gap:8px; flex-wrap:wrap;">
+            <button class="btn" style="background:rgba(124, 58, 237, 0.15); border:1px solid rgba(124, 58, 237, 0.4); color:#c4b5fd; font-size:12px;" onclick="importFromDefaultDns()">
+              📥 Importar da Lista Padrão
+            </button>
+            <button class="btn btn-danger" style="font-size:12px;" onclick="clearAllRouterDns()">🗑️ Limpar Todos</button>
+          </div>
+        </div>
+
+        <div class="dns-tag-container" id="router-dns-tags">
+          <!-- Renderizado via JS -->
+        </div>
+
+        <div style="margin-top:20px; display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px;">
+          <div style="font-size:12px; color:var(--text-muted);" id="router-dns-footer-info">
+            Alterações são salvas na nuvem e aplicadas diretamente no hardware.
+          </div>
+          <div style="display:flex; gap:8px;">
+            <button class="btn" onclick="closeRouterDnsModal()">Cancelar</button>
+            <button class="btn" style="background:#2563eb; color:#fff;" onclick="saveRouterDnsList(false)">💾 Salvar</button>
+            <button class="btn btn-primary" style="background:linear-gradient(135deg, #10b981, #059669); border:none;" onclick="saveRouterDnsList(true)">
+              ⚡ Atualizar Bloqueios no Roteador
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- MODAL DE HISTÓRICO DE TELEMETRIA (ATÉ 365 DIAS / 10 EM 10 MIN) -->
+  <div class="modal-backdrop" id="modal-history">
+    <div class="modal-container" style="max-width: 1020px; max-height: 92vh; display:flex; flex-direction:column;">
+      <div class="modal-header">
+        <div class="modal-title">
+          <span>📊 Histórico de Telemetria (10 em 10 min) —</span>
+          <span id="history-router-name" style="color:var(--accent-cyan);">Roteador</span>
+        </div>
+        <button class="modal-close" onclick="closeHistoryModal()">&times;</button>
+      </div>
+      <div class="modal-body" style="overflow-y:auto; padding:18px 20px;">
+        <!-- Barra de Período e Ações -->
+        <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px; margin-bottom:16px; background:#0b0f19; padding:10px 14px; border-radius:10px; border:1px solid var(--border-color);">
+          <div style="display:flex; align-items:center; gap:6px; flex-wrap:wrap;" id="history-period-btns">
+            <span style="font-size:12px; color:var(--text-muted); font-weight:600; margin-right:4px;">Período:</span>
+            <button class="btn" data-days="1" onclick="changeHistoryPeriod(1)" style="padding:5px 12px; font-size:12px;">24 Horas</button>
+            <button class="btn btn-primary" data-days="7" onclick="changeHistoryPeriod(7)" style="padding:5px 12px; font-size:12px;">7 Dias</button>
+            <button class="btn" data-days="30" onclick="changeHistoryPeriod(30)" style="padding:5px 12px; font-size:12px;">30 Dias</button>
+            <button class="btn" data-days="90" onclick="changeHistoryPeriod(90)" style="padding:5px 12px; font-size:12px;">90 Dias</button>
+            <button class="btn" data-days="365" onclick="changeHistoryPeriod(365)" style="padding:5px 12px; font-size:12px;">365 Dias (1 Ano)</button>
+          </div>
+          <div style="display:flex; gap:8px;">
+            <button class="btn" style="padding:5px 12px; font-size:12px;" onclick="refreshHistoryData()">🔄 Atualizar</button>
+            <button class="btn" style="padding:5px 12px; font-size:12px; background:rgba(16,185,129,0.15); border:1px solid rgba(16,185,129,0.4); color:#34d399;" onclick="exportHistoryCsv()">📥 Exportar CSV</button>
+          </div>
+        </div>
+
+        <!-- Cards Resumo do Período -->
+        <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(200px, 1fr)); gap:12px; margin-bottom:16px;">
+          <div style="background:#0f172a; border:1px solid var(--border-color); border-radius:10px; padding:12px 14px;">
+            <div style="font-size:11px; color:var(--text-muted); text-transform:uppercase; font-weight:600;">Disponibilidade (Online)</div>
+            <div id="hist-kpi-uptime" style="font-size:22px; font-weight:700; color:var(--accent-emerald); margin-top:4px;">—</div>
+            <div id="hist-kpi-uptime-sub" style="font-size:11px; color:var(--text-muted); margin-top:2px;">Janelas de 10 min</div>
+          </div>
+          <div style="background:#0f172a; border:1px solid var(--border-color); border-radius:10px; padding:12px 14px;">
+            <div style="font-size:11px; color:var(--text-muted); text-transform:uppercase; font-weight:600;">Clientes Conectados</div>
+            <div id="hist-kpi-clients" style="font-size:22px; font-weight:700; color:#38bdf8; margin-top:4px;">—</div>
+            <div id="hist-kpi-clients-sub" style="font-size:11px; color:var(--text-muted); margin-top:2px;">Pico / Média no período</div>
+          </div>
+          <div style="background:#0f172a; border:1px solid var(--border-color); border-radius:10px; padding:12px 14px;">
+            <div style="font-size:11px; color:var(--text-muted); text-transform:uppercase; font-weight:600;">Carga de CPU (Load 1m)</div>
+            <div id="hist-kpi-cpu" style="font-size:22px; font-weight:700; color:var(--accent-amber); margin-top:4px;">—</div>
+            <div id="hist-kpi-cpu-sub" style="font-size:11px; color:var(--text-muted); margin-top:2px;">Média / Pico no período</div>
+          </div>
+          <div style="background:#0f172a; border:1px solid var(--border-color); border-radius:10px; padding:12px 14px;">
+            <div style="font-size:11px; color:var(--text-muted); text-transform:uppercase; font-weight:600;">Memória RAM Livre</div>
+            <div id="hist-kpi-mem" style="font-size:22px; font-weight:700; color:#c4b5fd; margin-top:4px;">—</div>
+            <div id="hist-kpi-mem-sub" style="font-size:11px; color:var(--text-muted); margin-top:2px;">Média / Mínima no período</div>
+          </div>
+        </div>
+
+        <!-- Linha do Tempo de Conectividade (Online / Offline) -->
+        <div style="background:#0b0f19; border:1px solid var(--border-color); border-radius:10px; padding:12px 14px; margin-bottom:14px;">
+          <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
+            <span style="font-size:12px; font-weight:600; color:#f8fafc;">🟢 Status de Conexão (Timeframes de 10 min)</span>
+            <span style="font-size:11px; color:var(--text-muted);">Verde = Conectado &nbsp;|&nbsp; Vermelho = Desconectado</span>
+          </div>
+          <canvas id="chart-history-online" width="940" height="42" style="width:100%; height:42px; display:block; border-radius:6px; background:#060911;"></canvas>
+        </div>
+
+        <!-- Gráficos de Clientes, Carga de CPU e Memória Livre -->
+        <div style="display:grid; grid-template-columns:1fr; gap:14px; margin-bottom:16px;">
+          <div style="background:#0b0f19; border:1px solid var(--border-color); border-radius:10px; padding:12px 14px;">
+            <div style="font-size:12px; font-weight:600; color:#34d399; margin-bottom:6px;">👥 Quantidade de Clientes Conectados (10 em 10 min)</div>
+            <canvas id="chart-history-clients" width="940" height="130" style="width:100%; height:130px; display:block;"></canvas>
+          </div>
+          <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(420px, 1fr)); gap:14px;">
+            <div style="background:#0b0f19; border:1px solid var(--border-color); border-radius:10px; padding:12px 14px;">
+              <div style="font-size:12px; font-weight:600; color:#fbbf24; margin-bottom:6px;">⚡ Carga de CPU — Load Average (10 em 10 min)</div>
+              <canvas id="chart-history-cpu" width="450" height="130" style="width:100%; height:130px; display:block;"></canvas>
+            </div>
+            <div style="background:#0b0f19; border:1px solid var(--border-color); border-radius:10px; padding:12px 14px;">
+              <div style="font-size:12px; font-weight:600; color:#38bdf8; margin-bottom:6px;">🧠 Memória RAM Livre em MB (10 em 10 min)</div>
+              <canvas id="chart-history-mem" width="450" height="130" style="width:100%; height:130px; display:block;"></canvas>
+            </div>
+          </div>
+        </div>
+
+        <!-- Tabela Detalhada dos Registros de 10 em 10 min -->
+        <div style="background:#0b0f19; border:1px solid var(--border-color); border-radius:10px; padding:12px 14px;">
+          <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:10px;">
+            <span style="font-size:12px; font-weight:600; color:#f8fafc;">📋 Registros Detalhados (Janelas de 10 min mais recentes)</span>
+            <span id="history-records-count" style="font-size:11px; color:var(--text-muted);">0 registros</span>
+          </div>
+          <div style="max-height:220px; overflow-y:auto;" id="history-table-container">
+            Carregando histórico...
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Tooltip Flutuante Interativo dos Gráficos de Histórico -->
+  <div id="history-hover-tooltip" class="history-tooltip"></div>
+
+  <!-- MODAL: GESTÃO DE USUÁRIOS (ADMIN) -->
+  <div class="modal-backdrop" id="modal-users">
+    <div class="modal-container" style="max-width: 900px;">
+      <div class="modal-header">
+        <div class="modal-title">👥 Gerenciar Usuários da Plataforma</div>
+        <button class="modal-close" onclick="closeUsersModal()">&times;</button>
+      </div>
+      <div class="modal-body" style="padding:18px;">
+        <div id="users-table-wrap"></div>
+        <form id="user-form" class="user-form" onsubmit="submitUserForm(event)" autocomplete="off">
+          <div class="user-form-title" id="uf-title">➕ Novo usuário</div>
+          <div class="user-form-grid">
+            <div><label for="uf-username">Login</label><input type="text" id="uf-username" placeholder="ex: maria.silva" autocapitalize="none" spellcheck="false" required></div>
+            <div><label for="uf-name">Nome</label><input type="text" id="uf-name" placeholder="Nome completo"></div>
+            <div><label for="uf-role">Perfil</label>
+              <select id="uf-role">
+                <option value="viewer">Visualizador — somente leitura</option>
+                <option value="operator">Operador — terminal, DNS, QoS, reboot</option>
+                <option value="admin">Administrador — tudo + usuários</option>
+              </select>
+            </div>
+            <div><label for="uf-password" id="uf-pw-label">Senha temporária</label><input type="password" id="uf-password" placeholder="mín. 10 caracteres, letras e números" autocomplete="new-password"></div>
+          </div>
+          <div class="user-form-checks">
+            <label class="uf-check" id="uf-must-row"><input type="checkbox" id="uf-must" checked> Exigir troca de senha no primeiro acesso</label>
+            <label class="uf-check" id="uf-active-row" style="display:none;"><input type="checkbox" id="uf-active" checked> Conta ativa</label>
+          </div>
+          <div class="form-error" id="uf-error"></div>
+          <div class="user-form-actions">
+            <button type="button" class="btn" id="uf-cancel" style="display:none;" onclick="cancelUserEdit()">Cancelar edição</button>
+            <button type="submit" class="btn btn-primary" id="uf-submit">Criar usuário</button>
+          </div>
+        </form>
+      </div>
+    </div>
+  </div>
+
+  <!-- MODAL: ALTERAR SENHA -->
+  <div class="modal-backdrop" id="modal-password">
+    <div class="modal-container" style="max-width: 440px;">
+      <div class="modal-header">
+        <div class="modal-title">🔑 Alterar Senha</div>
+        <button class="modal-close" id="pw-close-btn" onclick="closeChangePasswordModal()">&times;</button>
+      </div>
+      <div class="modal-body" style="padding:18px;">
+        <div class="pw-forced-note" id="pw-forced-note" style="display:none;">Por segurança, defina uma nova senha pessoal antes de continuar.</div>
+        <form class="user-form" style="margin-top:0; border:0; padding:0;" onsubmit="submitChangePassword(event)">
+          <label for="pw-current">Senha atual</label>
+          <input type="password" id="pw-current" autocomplete="current-password" required>
+          <label for="pw-new">Nova senha</label>
+          <input type="password" id="pw-new" autocomplete="new-password" placeholder="mín. 10 caracteres, letras e números" required>
+          <label for="pw-confirm">Confirmar nova senha</label>
+          <input type="password" id="pw-confirm" autocomplete="new-password" required>
+          <div class="form-error" id="pw-error"></div>
+          <div class="user-form-actions">
+            <button type="button" class="btn" id="pw-cancel-btn" onclick="closeChangePasswordModal()">Cancelar</button>
+            <button type="submit" class="btn btn-primary">Salvar nova senha</button>
+          </div>
+        </form>
+      </div>
+    </div>
+  </div>
+
+  <script src="/dashboard/app.js?v=20261027_01"></script>
+</body>
+</html>

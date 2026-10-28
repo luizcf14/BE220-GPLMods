@@ -1,0 +1,16 @@
+#!/bin/sh
+# /etc/hotplug.d/iface/99-zerotier
+# Automatiza a atribuição do IP do ZeroTier à interface zt* no kernel Linux
+
+# Colunas do zerotier-cli listnetworks:
+# $1=200 $2=listnetworks $3=nwid $4=name $5=mac $6=status $7=type $8=dev $9=assigned_ip
+ZT_DEV=$(zerotier-cli listnetworks 2>/dev/null | awk '/OK PRIVATE/{print $8}' | head -1)
+ZT_IP=$(zerotier-cli listnetworks 2>/dev/null | awk '/OK PRIVATE/{print $9}' | head -1)
+
+if [ -n "$ZT_DEV" ] && [ -n "$ZT_IP" ] && [ "$ZT_DEV" != "OK" ]; then
+	CLEAN_IP=$(echo "$ZT_IP" | cut -d'/' -f1)
+	if ! ip addr show dev "$ZT_DEV" 2>/dev/null | grep -q "$CLEAN_IP"; then
+		ip addr add "$ZT_IP" dev "$ZT_DEV" 2>/dev/null || true
+		logger -t zerotier-hotplug "IP $ZT_IP vinculado com sucesso à interface $ZT_DEV"
+	fi
+fi

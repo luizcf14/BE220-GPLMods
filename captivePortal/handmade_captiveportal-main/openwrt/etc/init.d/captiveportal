@@ -1,0 +1,588 @@
+#!/bin/sh /etc/rc.common
+# Portal Captivo 3000 — Serviço procd
+# /etc/init.d/captiveportal
+#
+# Uso:
+#   service captiveportal start    — aplica regras nftables + tc/HTB + dnsmasq
+#   service captiveportal stop     — remove todas as regras e configurações
+#   service captiveportal restart  — recarrega sem derrubar sessões ativas
+#   service captiveportal enable   — habilita início automático no boot
+#   service captiveportal disable  — desabilita início no boot
+#
+# Padrão OpenWrt procd (igual ao uhttpd, firewall, etc.)
+
+USE_PROCD=1
+START=95
+STOP=05
+
+CAPTIVE_CONF="/etc/config/captiveportal"
+# /tmp/dnsmasq.d/ é volátil: no reboot o arquivo não existe,
+# dnsmasq sobe limpo sem tentar acessar sets nft inexistentes.
+# O captiveportal start recria o arquivo e reinicia o dnsmasq.
+DNSMASQ_WHITELIST="/tmp/dnsmasq.d/captive-whitelist.conf"
+DNSMASQ_BLACKLIST="/tmp/dnsmasq.d/captive-blacklist.conf"
+SESSIONS_FILE="/tmp/captiveportal_sessions.json"
+NFT_TABLE="inet fw4"
+NFT_TEMPLATE="/etc/captiveportal/10-captive-portal.nft.tpl"
+NFT_GENERATED="/etc/nftables.d/10-captive-portal.nft"
+
+_bind_zerotier_ip() {
+	local zt_dev zt_ip clean_ip
+	zt_dev=$(zerotier-cli listnetworks 2>/dev/null | awk '/OK PRIVATE/{print $8}' | head -1)
+	zt_ip=$(zerotier-cli listnetworks 2>/dev/null | awk '/OK PRIVATE/{print $9}' | head -1)
+	if [ -n "$zt_dev" ] && [ -n "$zt_ip" ] && [ "$zt_dev" != "OK" ]; then
+		clean_ip=$(echo "$zt_ip" | cut -d'/' -f1)
+		if ! ip addr show dev "$zt_dev" 2>/dev/null | grep -q "$clean_ip"; then
+			ip addr add "$zt_ip" dev "$zt_dev" 2>/dev/null || true
+			logger -t captiveportal "  IP ZeroTier $zt_ip reatribuído com sucesso à interface $zt_dev"
+		fi
+	fi
+}
+
+# ---------------------------------------------------------------------------
+# Lê configuração UCI
+# ---------------------------------------------------------------------------
+_load_config() {
+	API_URL=$(uci -q get captiveportal.global.api_url)
+	API_USER_PATH=$(uci -q get captiveportal.global.api_user_path)
+	SESSION_TIME=$(uci -q get captiveportal.global.session_time)
+	WAN_IF=$(uci -q get captiveportal.global.wan_interface)
+	LAN_IF=$(uci -q get captiveportal.global.lan_interface)
+	ROUTER_IP=$(uci -q get captiveportal.global.router_ip)
+	ROUTER_DOMAIN=$(uci -q get captiveportal.global.router_domain)
+	PORTAL_PORT=$(uci -q get captiveportal.global.portal_port)
+
+	# Valores padrão e auto-detecção da interface WAN se a configurada não existir
+	: ${SESSION_TIME:=3600}
+	if [ -z "$WAN_IF" ] || ! ip link show "$WAN_IF" >/dev/null 2>&1; then
+		AUTO_WAN=$(ip route show default 2>/dev/null | awk '/default/ {print $5}' | head -n1)
+		[ -n "$AUTO_WAN" ] && WAN_IF="$AUTO_WAN"
+	fi
+	: ${WAN_IF:=eth0}
+	: ${LAN_IF:=br-lan}
+	: ${ROUTER_IP:=192.168.1.1}
+	: ${ROUTER_DOMAIN:=roteador.conexaopovosdafloresta.org.br}
+	: ${PORTAL_PORT:=2080}
+
+	# Configura Packet Steering por padrão em todas as CPUs se desativado
+	local ps_val
+	ps_val=$(uci -q get network.globals.packet_steering 2>/dev/null || echo "0")
+	if [ "$ps_val" = "0" ] || [ -z "$ps_val" ]; then
+		uci set network.globals.packet_steering='1' 2>/dev/null || true
+		uci commit network 2>/dev/null || true
+		logger -t captiveportal "Packet Steering habilitado por padrão para todas as CPUs."
+	fi
+}
+
+# ---------------------------------------------------------------------------
+# Gera e aplica as regras nftables a partir do template
+# ---------------------------------------------------------------------------
+_apply_nft_rules() {
+	if [ ! -f "$NFT_TEMPLATE" ]; then
+		logger -t captiveportal "ERRO: template nft não encontrado: $NFT_TEMPLATE"
+		return 1
+	fi
+
+	logger -t captiveportal "Gerando regras nftables: LAN=$LAN_IF WAN=$WAN_IF ROUTER=$ROUTER_IP"
+
+	sed \
+		-e "s|__LAN_IF__|${LAN_IF}|g" \
+		-e "s|__WAN_IF__|${WAN_IF}|g" \
+		-e "s|__ROUTER_IP__|${ROUTER_IP}|g" \
+		"$NFT_TEMPLATE" > "$NFT_GENERATED"
+
+	# -------------------------------------------------------------------
+	# Registra o arquivo nas 'includes' da UCI do firewall.
+	# fw4 carrega todo include com type=nftables DEPOIS de reconstruir
+	# o ruleset — assim sobrevive a qualquer 'firewall reload'.
+	# -------------------------------------------------------------------
+	uci delete firewall.captiveportal_nft 2>/dev/null || true
+	uci set    firewall.captiveportal_nft=include
+	uci set    firewall.captiveportal_nft.path="$NFT_GENERATED"
+	uci set    firewall.captiveportal_nft.type='nftables'
+	uci set    firewall.captiveportal_nft.reload='1'
+	uci commit firewall 2>/dev/null || true
+	logger -t captiveportal "  Include fw4 registrado: $NFT_GENERATED"
+
+	# Aplica imediatamente (sem esperar o próximo reload do fw4)
+	if nft -f "$NFT_GENERATED" 2>/tmp/captive_nft_err; then
+		logger -t captiveportal "Regras nftables aplicadas com sucesso."
+	else
+		logger -t captiveportal "ERRO ao carregar regras nft: $(cat /tmp/captive_nft_err)"
+		return 1
+	fi
+}
+
+# ---------------------------------------------------------------------------
+# Remove as chains e sets criados pelo portal (cleanup no stop)
+# ---------------------------------------------------------------------------
+_remove_nft_rules() {
+	logger -t captiveportal "Removendo regras nftables do portal captivo..."
+
+	# Remove include da UCI do firewall
+	uci delete firewall.captiveportal_nft 2>/dev/null || true
+	uci commit firewall 2>/dev/null || true
+
+	# Esvazia sets antes de remover (evita dependências)
+	nft flush set  inet fw4 captive_authenticated 2>/dev/null || true
+	nft flush set  inet fw4 captive_whitelist      2>/dev/null || true
+	nft flush map  inet fw4 captive_fwmark         2>/dev/null || true
+
+	# Remove chains injetadas
+	nft delete chain inet fw4 captive_prerouting 2>/dev/null || true
+	nft delete chain inet fw4 captive_forward    2>/dev/null || true
+	nft delete chain inet fw4 captive_mangle     2>/dev/null || true
+
+	# Remove sets/maps (após as chains que os referenciam)
+	nft delete set  inet fw4 captive_authenticated 2>/dev/null || true
+	nft delete set  inet fw4 captive_whitelist      2>/dev/null || true
+	nft delete map  inet fw4 captive_fwmark         2>/dev/null || true
+
+	# Remove arquivo gerado
+	rm -f "$NFT_GENERATED"
+
+	logger -t captiveportal "Regras nftables removidas."
+}
+
+# ---------------------------------------------------------------------------
+# Gera configuração dnsmasq para o walled garden
+# Usa dnsmasq-full com suporte a nftset=
+# ---------------------------------------------------------------------------
+_setup_walled_garden() {
+	logger -t captiveportal "Gerando configuração walled garden..."
+	# /tmp/dnsmasq.d/ é volátil: desaparece no reboot.
+	# Isso evita que dnsmasq tente ler nftset= quando os sets não existem.
+	mkdir -p /tmp/dnsmasq.d
+
+	# Detecta se o dnsmasq instalado tem suporte a nftset= (dnsmasq-full)
+	HAS_NFTSET=false
+	if dnsmasq --version 2>&1 | grep -v 'no-nftset' | grep -q "nftset"; then
+		HAS_NFTSET=true
+		logger -t captiveportal "  dnsmasq-full detectado: usando nftset= (liberação de IP em tempo real)"
+	else
+		logger -t captiveportal "  dnsmasq padrão: usando nslookup + cron refresh"
+	fi
+
+	# Cria arquivo limpo
+	cat > "$DNSMASQ_WHITELIST" << 'HEADER'
+# Portal Captivo 3000 — Walled Garden (gerado automaticamente)
+# NÃO edite este arquivo. Use: uci add_list captiveportal.walled_garden.domain=...
+# e então: service captiveportal restart
+HEADER
+
+	# Garante que o dnsmasq leia /tmp/dnsmasq.d/ (volátil)
+	uci set dhcp.@dnsmasq[0].confdir='/tmp/dnsmasq.d' 2>/dev/null || true
+	uci commit dhcp 2>/dev/null || true
+
+	# Mapeia o domínio do roteador localmente para o IP do roteador
+	if [ -n "$ROUTER_DOMAIN" ]; then
+		# address= é suportado por TODOS os dnsmasq
+		echo "address=/${ROUTER_DOMAIN}/${ROUTER_IP}" >> "$DNSMASQ_WHITELIST"
+		nft add element inet fw4 captive_whitelist "{ ${ROUTER_IP} }" 2>/dev/null || true
+		logger -t captiveportal "  Domínio local do roteador: $ROUTER_DOMAIN -> $ROUTER_IP"
+
+		$HAS_NFTSET && echo "nftset=/${ROUTER_DOMAIN}/4#inet#fw4#captive_whitelist" >> "$DNSMASQ_WHITELIST"
+
+		# Registra domínio no UCI dhcp
+		if [ -f /sbin/uci ]; then
+			uci delete dhcp.captive_domain 2>/dev/null || true
+			uci set dhcp.captive_domain=domain
+			uci set dhcp.captive_domain.name="$ROUTER_DOMAIN"
+			uci set dhcp.captive_domain.ip="$ROUTER_IP"
+			uci commit dhcp 2>/dev/null || true
+		fi
+
+		# Garante entrada no /etc/hosts do roteador
+		if ! grep -q "$ROUTER_DOMAIN" /etc/hosts 2>/dev/null; then
+			echo "$ROUTER_IP $ROUTER_DOMAIN" >> /etc/hosts
+			logger -t captiveportal "  Adicionado ao /etc/hosts: $ROUTER_IP $ROUTER_DOMAIN"
+		fi
+
+		# RFC 8910 — DHCP Option 114 (CAPPORT)
+		local capport_url="http://${ROUTER_DOMAIN}/cgi-bin/captive_portal_api"
+		echo "dhcp-option=114,${capport_url}" >> "$DNSMASQ_WHITELIST"
+		logger -t captiveportal "  DHCP Option 114 (CAPPORT): $capport_url"
+	fi
+
+	# Inclui automaticamente o hostname da api_url configurada
+	if [ -n "$API_URL" ]; then
+		local api_host
+		api_host=$(echo "$API_URL" | sed 's|https\?://||; s|/.*||; s|:.*||')
+		[ -n "$api_host" ] && _add_whitelist_domain "$api_host"
+	fi
+
+	# Para cada domínio configurado manualmente
+	config_list_foreach walled_garden domain _add_whitelist_domain
+
+	# Reinicia dnsmasq para aplicar
+	/etc/init.d/dnsmasq restart > /dev/null 2>&1
+	logger -t captiveportal "Walled garden configurado."
+
+	# -----------------------------------------------------------------------
+	# Cron: refresh de IPs a cada 2 minutos (backup para resolver CDNs)
+	# -----------------------------------------------------------------------
+	local cron_entry="*/2 * * * * /etc/captiveportal/refresh-whitelist.sh"
+	if ! crontab -l 2>/dev/null | grep -q "refresh-whitelist"; then
+		(crontab -l 2>/dev/null; echo "$cron_entry") | crontab -
+		/etc/init.d/cron restart > /dev/null 2>&1 || true
+		logger -t captiveportal "  Cron refresh de whitelist registrado (a cada 2min)"
+	fi
+
+	# -----------------------------------------------------------------------
+	# Cron: auto-renovação de sessões ativas a cada 5 minutos
+	# -----------------------------------------------------------------------
+	local cron_renew="*/5 * * * * /etc/captiveportal/renew-sessions.sh"
+	if ! crontab -l 2>/dev/null | grep -q "renew-sessions"; then
+		(crontab -l 2>/dev/null; echo "$cron_renew") | crontab -
+		/etc/init.d/cron restart > /dev/null 2>&1 || true
+		logger -t captiveportal "  Cron de auto-renovação de sessão registrado (a cada 5min)"
+	fi
+
+	# -----------------------------------------------------------------------
+	# Garante que o IP do ZeroTier permaneça atrelado ao kernel após start/reload
+	# -----------------------------------------------------------------------
+	_bind_zerotier_ip
+}
+
+# ---------------------------------------------------------------------------
+# Configura Blacklist DNS (redireciona domínios bloqueados para o IP do roteador)
+# ---------------------------------------------------------------------------
+_setup_blacklist() {
+	local enabled
+	enabled=$(uci -q get captiveportal.blacklist.enabled 2>/dev/null || echo "1")
+
+	if [ "$enabled" = "0" ] || [ "$enabled" = "off" ] || [ "$enabled" = "false" ]; then
+		rm -f "$DNSMASQ_BLACKLIST"
+		logger -t captiveportal "Blacklist por DNS desabilitada."
+		return 0
+	fi
+
+	logger -t captiveportal "Configurando Blacklist por DNS (redirecionamento para $ROUTER_IP)..."
+	mkdir -p /tmp/dnsmasq.d
+	> "$DNSMASQ_BLACKLIST"
+
+	# Adiciona domínios configurados na UCI
+	config_get domains blacklist domain
+	for domain in $domains; do
+		[ -z "$domain" ] && continue
+		echo "address=/${domain}/${ROUTER_IP}" >> "$DNSMASQ_BLACKLIST"
+		logger -t captiveportal "  Blacklist DNS manual: $domain -> $ROUTER_IP"
+	done
+
+	# Adiciona domínios da lista da comunidade se baixados em /tmp/community-blacklist.txt
+	if [ -f /tmp/community-blacklist.txt ]; then
+		local count
+		count=$(wc -l < /tmp/community-blacklist.txt 2>/dev/null || echo 0)
+		if [ "$count" -gt 0 ]; then
+			awk -v rip="$ROUTER_IP" '{if ($1 ~ /^[a-zA-Z0-9.-]+$/) print "address=/"$1"/"rip}' /tmp/community-blacklist.txt >> "$DNSMASQ_BLACKLIST"
+			logger -t captiveportal "  Blacklist comunidade carregada: $count domínios."
+		fi
+	fi
+
+	# Garante que NENHUM domínio da Whitelist (walled_garden) esteja na Blacklist!
+	local wdomains wclean
+	config_get wdomains walled_garden domain
+	for wdom in $wdomains; do
+		wclean=$(echo "$wdom" | sed 's/^\*\.//')
+		[ -z "$wclean" ] && continue
+		sed -i "\|address=/${wclean}/|d" "$DNSMASQ_BLACKLIST" 2>/dev/null || true
+	done
+
+	/etc/init.d/dnsmasq restart > /dev/null 2>&1 || true
+}
+
+_add_whitelist_domain() {
+	local domain="$1"
+	[ -z "$domain" ] && return
+
+	if [ "$HAS_NFTSET" = "true" ]; then
+		echo "nftset=/${domain}/4#inet#fw4#captive_whitelist" >> "$DNSMASQ_WHITELIST"
+	fi
+
+	# Resolução direta via nslookup (pré-popula o set no startup)
+	# timeout 10m: o cron de 2min renova antes de expirar
+	local ips
+	ips=$(nslookup "$domain" 2>/dev/null \
+		| awk '/^Address: / {print $2}' \
+		| grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$')
+	for ip in $ips; do
+		nft add element inet fw4 captive_whitelist "{ $ip timeout 10m }" 2>/dev/null || true
+		logger -t captiveportal "  Walled garden IP: $domain -> $ip"
+	done
+	logger -t captiveportal "  Domínio liberado: $domain"
+}
+
+# ---------------------------------------------------------------------------
+# Configura classes tc/HTB para controle de banda por perfil
+# ---------------------------------------------------------------------------
+_setup_tc() {
+	local enable_qos
+	enable_qos=$(uci -q get captiveportal.global.enable_qos 2>/dev/null || echo "1")
+
+	if [ "$enable_qos" = "0" ] || [ "$enable_qos" = "off" ] || [ "$enable_qos" = "false" ]; then
+		logger -t captiveportal "QoS / Controle de Banda desabilitado nas configurações."
+		_teardown_tc
+
+		# Ativa Flow Offloading no firewall (acelera roteamento via hardware/kernel quando sem QoS)
+		if [ "$(uci -q get firewall.@defaults[0].flow_offloading)" != "1" ]; then
+			uci set firewall.@defaults[0].flow_offloading='1' 2>/dev/null
+			uci set firewall.@defaults[0].flow_offloading_hw='1' 2>/dev/null
+			uci commit firewall 2>/dev/null
+			/etc/init.d/firewall reload >/dev/null 2>&1 || true
+			logger -t captiveportal "  Software/Hardware Flow Offloading ativado no firewall (máximo desempenho)."
+		fi
+		return 0
+	else
+		# Quando QoS está ativo, desativa Flow Offloading para permitir enfileiramento tc/HTB
+		if [ "$(uci -q get firewall.@defaults[0].flow_offloading)" = "1" ]; then
+			uci set firewall.@defaults[0].flow_offloading='0' 2>/dev/null
+			uci set firewall.@defaults[0].flow_offloading_hw='0' 2>/dev/null
+			uci commit firewall 2>/dev/null
+			/etc/init.d/firewall reload >/dev/null 2>&1 || true
+			logger -t captiveportal "  Flow Offloading desativado para permitir enfileiramento QoS/HTB."
+		fi
+	fi
+
+	if ! command -v tc >/dev/null 2>&1; then
+		logger -t captiveportal "AVISO: 'tc' não encontrado — QoS/HTB desabilitado."
+		logger -t captiveportal "  Para habilitar: opkg update && opkg install tc kmod-sched-core kmod-sched-htb kmod-sched-fq-codel"
+		return 0
+	fi
+
+	local wan_speed
+	wan_speed=$(uci -q get captiveportal.global.wan_speed 2>/dev/null || echo "800mbit")
+	: ${wan_speed:=800mbit}
+
+	logger -t captiveportal "Configurando classes tc/HTB na interface $WAN_IF (capacidade WAN: $wan_speed)..."
+
+	# Remove qdiscs anteriores
+	tc qdisc del dev "$WAN_IF" root 2>/dev/null || true
+
+	# Cria qdisc raiz HTB
+	# r2q 1 evita o aviso "quantum of class is big" para classes de alta vazão
+	tc qdisc add dev "$WAN_IF" root handle 1: htb default 9999 r2q 1
+
+	# Classe raiz (capacidade total da WAN)
+	tc class add dev "$WAN_IF" parent 1: classid 1:1 htb rate "$wan_speed" ceil "$wan_speed" burst 100k cburst 100k quantum 1514
+
+	# Classe padrão para não autenticados (baixa prioridade)
+	tc class add dev "$WAN_IF" parent 1:1 classid 1:9999 htb rate 512kbit ceil 1mbit prio 7 quantum 1514
+
+	# Cria uma classe HTB por perfil configurado
+	config_foreach _setup_tc_profile profile
+
+	logger -t captiveportal "Classes tc/HTB configuradas."
+}
+
+_setup_tc_profile() {
+	local cfg="$1"
+	local name fwmark dl_kbit ul_kbit
+
+	config_get name    "$cfg" name
+	config_get fwmark  "$cfg" fwmark
+	config_get dl_kbit "$cfg" dl_kbit 0
+	config_get ul_kbit "$cfg" ul_kbit 0
+
+	[ -z "$fwmark" ] && return
+
+	local class_id="1:$((100 + fwmark))"
+	local wan_speed
+	wan_speed=$(uci -q get captiveportal.global.wan_speed 2>/dev/null || echo "800mbit")
+
+	if [ "$dl_kbit" = "0" ]; then
+		# Sem limite: usa a capacidade total da classe raiz
+		tc class add dev "$WAN_IF" parent 1:1 classid "$class_id" htb rate "$wan_speed" ceil "$wan_speed" burst 50k cburst 50k prio 1 quantum 1514
+	else
+		tc class add dev "$WAN_IF" parent 1:1 classid "$class_id" htb rate "${dl_kbit}kbit" ceil "${dl_kbit}kbit" burst 15k cburst 15k prio 2 quantum 1514
+	fi
+
+	# Adiciona fq_codel para fairness dentro da classe
+	tc qdisc add dev "$WAN_IF" parent "$class_id" fq_codel 2>/dev/null || true
+
+	# Filtro por fwmark → classe
+	tc filter add dev "$WAN_IF" parent 1: handle "$fwmark" fw flowid "$class_id"
+
+	logger -t captiveportal "  Perfil '$name' (fwmark=$fwmark): dl=${dl_kbit}kbps → classid=$class_id"
+}
+
+# ---------------------------------------------------------------------------
+# Remove configuração tc
+# ---------------------------------------------------------------------------
+_teardown_tc() {
+	command -v tc >/dev/null 2>&1 || return 0
+	tc qdisc del dev "$WAN_IF" root 2>/dev/null || true
+	logger -t captiveportal "Classes tc/HTB removidas."
+}
+
+# ---------------------------------------------------------------------------
+# Remove configuração dnsmasq do walled garden
+# ---------------------------------------------------------------------------
+_teardown_walled_garden() {
+	rm -f "$DNSMASQ_WHITELIST"
+	/etc/init.d/dnsmasq restart > /dev/null 2>&1
+
+	# Remove entrada do cron
+	if crontab -l 2>/dev/null | grep -q "refresh-whitelist"; then
+		crontab -l 2>/dev/null | grep -v "refresh-whitelist" | crontab -
+		/etc/init.d/cron restart > /dev/null 2>&1 || true
+	fi
+
+	logger -t captiveportal "Walled garden removido."
+}
+
+# ---------------------------------------------------------------------------
+# Esvazia os sets nftables (sem remover a estrutura)
+# ---------------------------------------------------------------------------
+_flush_nft_sets() {
+	nft flush set inet fw4 captive_authenticated 2>/dev/null || true
+	nft flush set inet fw4 captive_whitelist 2>/dev/null || true
+	nft flush map inet fw4 captive_fwmark 2>/dev/null || true
+	logger -t captiveportal "Sets nftables esvaziados."
+}
+
+# ---------------------------------------------------------------------------
+# Cria arquivo de sessões vazio
+# ---------------------------------------------------------------------------
+_init_sessions_file() {
+	echo '{"sessions":[]}' > "$SESSIONS_FILE"
+}
+
+# ---------------------------------------------------------------------------
+# Otimizações de Desempenho do Kernel e Rede
+# ---------------------------------------------------------------------------
+_tune_kernel_performance() {
+	logger -t captiveportal "Otimizando parâmetros de desempenho do kernel..."
+
+	# Aumenta tamanho da tabela conntrack (evita perda de conexão sob carga)
+	sysctl -w net.netfilter.nf_conntrack_max=32768 >/dev/null 2>&1 || true
+
+	# Aumenta backlog das interfaces de rede (evita drop por picos de conexões Wi-Fi)
+	sysctl -w net.core.netdev_max_backlog=5000 >/dev/null 2>&1 || true
+
+	# Habilita TCP Fast Open para acelerar conexões HTTP/CGI
+	sysctl -w net.ipv4.tcp_fastopen=3 >/dev/null 2>&1 || true
+
+	# Habilita SMP Packet Steering no OpenWrt (distribui interrupções de rede entre todos os núcleos da CPU)
+	if [ "$(uci -q get network.globals.packet_steering)" != "1" ]; then
+		uci set network.globals.packet_steering='1' 2>/dev/null
+		uci commit network 2>/dev/null
+		logger -t captiveportal "  Packet Steering ativado no OpenWrt (distribuição multi-core de CPU)."
+	fi
+
+	# Otimiza o cache local do dnsmasq se estiver pequeno
+	local cs
+	cs=$(uci -q get dhcp.@dnsmasq[0].cachesize 2>/dev/null || echo "150")
+	if [ "$cs" -lt 2000 ] 2>/dev/null; then
+		uci set dhcp.@dnsmasq[0].cachesize='5000' 2>/dev/null
+		uci commit dhcp 2>/dev/null
+		/etc/init.d/dnsmasq reload >/dev/null 2>&1 || true
+		logger -t captiveportal "  Cache DNS expandido para 5000 entradas."
+	fi
+}
+
+# ---------------------------------------------------------------------------
+# START
+# ---------------------------------------------------------------------------
+start_service() {
+	. /lib/functions.sh
+	config_load captiveportal
+	_load_config
+
+	logger -t captiveportal "Iniciando Portal Captivo 3000..."
+
+	# Aplica otimizações de desempenho do kernel
+	_tune_kernel_performance
+
+	# Inicializa arquivo de sessões
+	_init_sessions_file
+
+	# Gera e aplica as regras nftables com as interfaces do UCI
+	# Se falhar, aborta — sem as regras nft, o portal não funciona
+	# e o walled garden/tc ficam inconsistentes.
+	if ! _apply_nft_rules; then
+		logger -t captiveportal "ERRO FATAL: regras nftables não aplicadas. Abortando start."
+		return 1
+	fi
+
+	# Configura walled garden via dnsmasq
+	_setup_walled_garden
+
+	# Configura blacklist DNS via dnsmasq
+	_setup_blacklist
+
+	# Configura classes tc/HTB para QoS por perfil
+	_setup_tc
+
+	# Registra no procd (mantém o serviço "rodando" para enable/disable funcionar)
+	procd_open_instance
+	procd_set_param command /bin/sh -c "while true; do sleep 3600; done"
+	procd_set_param respawn
+	procd_close_instance
+
+	logger -t captiveportal "Portal Captivo 3000 ativo. Sessão timeout: ${SESSION_TIME}s"
+}
+
+# ---------------------------------------------------------------------------
+# STOP
+# ---------------------------------------------------------------------------
+stop_service() {
+	. /lib/functions.sh
+	config_load captiveportal
+	_load_config
+
+	logger -t captiveportal "Parando Portal Captivo 3000..."
+
+	# Esvazia sets e remove chains nftables
+	_remove_nft_rules
+
+	# Remove classes tc
+	_teardown_tc
+
+	# Remove walled garden do dnsmasq
+	_teardown_walled_garden
+
+	# Remove arquivo de sessões
+	rm -f "$SESSIONS_FILE"
+
+	logger -t captiveportal "Portal Captivo 3000 parado. Tráfego desbloqueado."
+}
+
+# ---------------------------------------------------------------------------
+# RELOAD (chamado pelo restart — preserva sessões ativas)
+# ---------------------------------------------------------------------------
+reload_service() {
+	. /lib/functions.sh
+	config_load captiveportal
+	_load_config
+
+	logger -t captiveportal "Recarregando configuração (sessões ativas preservadas)..."
+
+	# Reconfigura walled garden (sem impacto nas sessões)
+	_teardown_walled_garden
+	_setup_walled_garden
+
+	# Regenera regras nftables sem perder sessões autenticadas.
+	# O template usa 'add set' (idempotente) + 'flush chain' (limpa regras
+	# mas preserva o conteúdo dos sets). Então basta reaplicar o template.
+	# Não chamamos _remove_nft_rules() aqui pois ele deleta os sets.
+	logger -t captiveportal "  Reaplicando regras nftables (sets preservados)..."
+
+	# Regenera o arquivo a partir do template com as interfaces atuais
+	sed \
+		-e "s|__LAN_IF__|${LAN_IF}|g" \
+		-e "s|__WAN_IF__|${WAN_IF}|g" \
+		-e "s|__ROUTER_IP__|${ROUTER_IP}|g" \
+		"$NFT_TEMPLATE" > "$NFT_GENERATED"
+
+	if nft -f "$NFT_GENERATED" 2>/tmp/captive_nft_err; then
+		logger -t captiveportal "  Regras nftables reaplicadas (sessões preservadas)."
+	else
+		logger -t captiveportal "ERRO ao recarregar regras nft: $(cat /tmp/captive_nft_err)"
+	fi
+
+	# Reconfigura tc (recria classes)
+	_teardown_tc
+	_setup_tc
+
+	logger -t captiveportal "Configuração recarregada."
+}

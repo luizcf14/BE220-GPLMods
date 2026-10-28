@@ -1,0 +1,50 @@
+/dts-v1/;
+
+/ {
+	description = "Broadcom BCA image upgrade package tree binary";
+	#address-cells = <1>;
+
+	images {
+		loader_6764 {
+			description = "loader";
+			data = /incbin/("mtd1_loader.bin");
+			type = "firmware";
+			compression = "none";
+			hash-1 {
+				algo = "sha256";
+			};
+		};
+
+		bootfs_6764 {
+			description = "bootfs";
+			data = /incbin/("mtd7_bootfs1.bin");
+			type = "multi";
+			compression = "none";
+			hash-1 {
+				algo = "sha256";
+			};
+		};
+
+		rootfs_6764 {
+			description = "rootfs";
+			data = /incbin/("rootfs1_mod.bin");
+			type = "filesystem";
+			compression = "none";
+			hash-1 {
+				algo = "sha256";
+			};
+		};
+	};
+
+	configurations {
+		default = "conf_6764_nand_squashfs";
+
+		conf_6764_nand_squashfs {
+			description = "Brcm Image Bundle";
+			loader = "loader_6764";
+			bootfs = "bootfs_6764";
+			rootfs = "rootfs_6764";
+			compatible = "flash=nand;chip=6764;fstype=squashfs";
+		};
+	};
+};

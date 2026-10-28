@@ -1,0 +1,59 @@
+#!/bin/sh
+# Portal Captivo 3000 — Captive Portal API RFC 8908 (BE220 Port)
+# /www/cgi-bin/captive_portal_api
+# Verifica autenticação via chain iptables CAPTIVE_AUTH_FWD (em vez de nftables set)
+
+export PATH=/sbin:/bin:/usr/sbin:/usr/bin:$PATH
+
+ROUTER_DOMAIN=$(/sbin/uci -q get captiveportal.global.router_domain 2>/dev/null || echo "roteador.conexaopovosdafloresta.org.br")
+ROUTER_IP=$(ip -4 addr show br-lan 2>/dev/null | awk '/inet / {print $2}' | cut -d/ -f1 | head -n1)
+[ -z "$ROUTER_IP" ] && ROUTER_IP=$(/sbin/uci -q get network.lan.ipaddr 2>/dev/null)
+[ -z "$ROUTER_IP" ] && ROUTER_IP=$(/sbin/uci -q get captiveportal.global.router_ip 2>/dev/null || echo "192.168.0.1")
+SESSIONS_FILE="/tmp/captiveportal_sessions.json"
+
+PORTAL_URL="http://${ROUTER_IP}/captive/"
+
+CLIENT_IP="$REMOTE_ADDR"
+
+printf 'Content-Type: application/captive+json\r\n'
+printf 'Cache-Control: no-store\r\n'
+printf 'Access-Control-Allow-Origin: *\r\n'
+
+if [ "$REQUEST_METHOD" = "OPTIONS" ]; then
+	printf 'Status: 204 No Content\r\n\r\n'; exit 0
+fi
+
+printf '\r\n'
+
+IS_AUTH=false
+SECONDS_REMAINING=0
+
+if [ -n "$CLIENT_IP" ]; then
+	# Consulta a chain iptables CAPTIVE_AUTH_FWD (mais rápido que nft list set)
+	if iptables -L CAPTIVE_AUTH_FWD -n 2>/dev/null | grep -q "ACCEPT.*${CLIENT_IP}"; then
+		IS_AUTH=true
+
+		# Busca tempo restante no arquivo de sessões
+		if [ -f "$SESSIONS_FILE" ]; then
+			NOW=$(date +%s)
+			EXPIRES=$(awk -v ip="$CLIENT_IP" '
+				/"sessions"/ { in_sess=1 }
+				in_sess && /"ip"/ && $0 ~ ip { found=1 }
+				found && /"expires"/ {
+					match($0, /[0-9]+/)
+					print substr($0, RSTART, RLENGTH)
+					exit
+				}
+			' "$SESSIONS_FILE" 2>/dev/null)
+			if [ -n "$EXPIRES" ] && [ "$EXPIRES" -gt "$NOW" ]; then
+				SECONDS_REMAINING=$(( EXPIRES - NOW ))
+			fi
+		fi
+	fi
+fi
+
+if $IS_AUTH; then
+	printf '{"captive":false,"seconds-remaining":%d}\n' "$SECONDS_REMAINING"
+else
+	printf '{"captive":true,"user-portal-url":"%s"}\n' "$PORTAL_URL"
+fi

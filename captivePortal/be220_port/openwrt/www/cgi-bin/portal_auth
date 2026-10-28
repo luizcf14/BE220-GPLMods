@@ -1,0 +1,196 @@
+#!/bin/sh
+# Portal Captivo 3000 — CGI de Autenticação (BE220 Port — iptables)
+# /www/cgi-bin/portal_auth
+
+export PATH=/sbin:/bin:/usr/sbin:/usr/bin:$PATH
+
+printf 'Content-Type: application/json\r\n'
+printf 'Access-Control-Allow-Origin: *\r\n'
+printf 'Access-Control-Allow-Methods: POST, OPTIONS\r\n'
+printf 'Access-Control-Allow-Headers: Content-Type\r\n'
+printf 'Cache-Control: no-store\r\n\r\n'
+
+if [ "$REQUEST_METHOD" = "OPTIONS" ]; then
+	exit 0
+fi
+if [ "$REQUEST_METHOD" != "POST" ]; then
+	printf '{"status":"error","message":"Method not allowed"}\n'; exit 0
+fi
+
+error_exit() {
+	logger -t portal_auth "ERRO [$CLIENT_IP]: $1"
+	printf '{"status":"error","message":"%s"}\n' "$1"; exit 0
+}
+
+# Lê configuração UCI
+API_URL=$(uci -q get captiveportal.global.api_url 2>/dev/null || echo "https://apidev.conexaopovosdafloresta.org.br")
+SESSION_TIME=$(uci -q get captiveportal.global.session_time 2>/dev/null || echo "3600")
+SESSIONS_FILE="/tmp/captiveportal_sessions.json"
+
+# IP do cliente
+CLIENT_IP="$REMOTE_ADDR"
+[ -z "$CLIENT_IP" ] && error_exit "IP do cliente não detectado"
+
+# MAC do cliente via tabela ARP do kernel
+CLIENT_MAC=$(awk -v ip="$CLIENT_IP" '$1==ip{print $4}' /proc/net/arp 2>/dev/null | head -1)
+[ -z "$CLIENT_MAC" ] && CLIENT_MAC="unknown"
+
+logger -t portal_auth "Requisição de autorização: IP=$CLIENT_IP MAC=$CLIENT_MAC"
+
+# Lê o body POST
+CONTENT_LENGTH="${CONTENT_LENGTH:-0}"
+POST_BODY=""
+if [ "$CONTENT_LENGTH" -gt 0 ] 2>/dev/null; then
+	POST_BODY=$(dd bs=1 count="$CONTENT_LENGTH" 2>/dev/null)
+fi
+
+# Extrai parâmetros
+_get_param() {
+	local key="$1"
+	local val
+	val=$(printf '%s&%s' "$QUERY_STRING" "$POST_BODY" | tr '&' '\n' | grep "^${key}=" | head -1 | sed "s/^${key}=//")
+	if [ -z "$val" ]; then
+		val=$(printf '%s' "$POST_BODY" | sed -n "s/.*\"${key}\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p" | head -1)
+	fi
+	printf '%s' "$val" | sed 's/+/ /g; s/%40/@/g; s/%2B/+/g; s/%2F/\//g; s/%3A/:/g; s/%20/ /g; s/%2E/./g'
+}
+
+EMAIL=$(_get_param email)
+PASSWORD=$(_get_param password)
+TOKEN=$(_get_param token)
+PROFILE=$(_get_param profile)
+
+USER_NAME="Usuário"
+ROLE_NAME="Visitante"
+
+if [ -n "$EMAIL" ] && [ -n "$PASSWORD" ]; then
+	logger -t portal_auth "Tentativa de login: $EMAIL (IP=$CLIENT_IP)"
+	COOKIE_JAR="/tmp/auth_${CLIENT_IP}_$$.txt"
+	rm -f "$COOKIE_JAR"
+
+	# 1. Obtém página de login e CSRF
+	LOGIN_HTML=$(/usr/bin/curl -s -k -m 8 -c "$COOKIE_JAR" "${API_URL}/login")
+	CSRF=$(printf '%s\n' "$LOGIN_HTML" | grep -o 'name="_token" value="[^"]*"' | head -1 | cut -d'"' -f4)
+
+	if [ -z "$CSRF" ]; then
+		rm -f "$COOKIE_JAR"
+		error_exit "Não foi possível conectar ao servidor central da Floresta."
+	fi
+
+	# 2. Executa autenticação contra o backend
+	POST_RES=$(/usr/bin/curl -s -k -m 10 -b "$COOKIE_JAR" -c "$COOKIE_JAR" -L \
+		-d "_token=$CSRF" \
+		--data-urlencode "email=$EMAIL" \
+		--data-urlencode "password=$PASSWORD" \
+		"${API_URL}/login")
+
+	rm -f "$COOKIE_JAR"
+
+	if echo "$POST_RES" | grep -q "Credenciais inválidas"; then
+		error_exit "Credenciais inválidas. Verifique seu e-mail e senha."
+	fi
+
+	if echo "$POST_RES" | grep -q "Confirmar acesso" || echo "$POST_RES" | grep -q "conectado"; then
+		PARSED_NAME=$(echo "$POST_RES" | sed -n 's/.*conectado(a) como \([^.<]*\).*/\1/p' | head -1 | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+		[ -n "$PARSED_NAME" ] && USER_NAME="$PARSED_NAME"
+	fi
+
+	[ "$USER_NAME" = "Usuário" ] && USER_NAME=$(echo "$EMAIL" | cut -d'@' -f1)
+	ROLE_NAME="${PROFILE:-Visitante}"
+
+elif [ -n "$TOKEN" ]; then
+	logger -t portal_auth "Validando token com backend..."
+	VALIDATE_URL="${API_URL}/api/user/me"
+	RESPONSE=$(/usr/bin/curl -s -k -m 10 -H "Authorization: Bearer $TOKEN" -H "Accept: application/json" "$VALIDATE_URL")
+
+	if echo "$RESPONSE" | grep -qE '"Unauthenticated"|"message".*"Unauthenticated"'; then
+		error_exit "Token inválido ou expirado"
+	fi
+
+	ROLE_NAME=$(printf '%s' "$RESPONSE" | sed -n 's/.*"role"[^{]*{[^}]*"name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
+	USER_NAME=$(printf '%s' "$RESPONSE" | sed -n 's/.*"name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
+	[ -z "$ROLE_NAME" ] && ROLE_NAME="Visitante"
+	[ -z "$USER_NAME" ] && USER_NAME="Visitante"
+else
+	error_exit "E-mail e senha são obrigatórios"
+fi
+
+# Busca fwmark do perfil no UCI
+FWMARK=""
+DL_KBIT=""
+UL_KBIT=""
+
+find_profile() {
+	local cfg="$1"
+	local pname fwmark dl ul
+	config_get pname  "$cfg" name
+	config_get fwmark "$cfg" fwmark
+	config_get dl     "$cfg" dl_kbit 0
+	config_get ul     "$cfg" ul_kbit 0
+	if [ "$pname" = "$ROLE_NAME" ]; then
+		FWMARK="$fwmark"; DL_KBIT="$dl"; UL_KBIT="$ul"
+	fi
+}
+
+. /lib/functions.sh
+config_load captiveportal
+config_foreach find_profile profile
+
+if [ -z "$FWMARK" ]; then
+	FWMARK=1; DL_KBIT=2048; UL_KBIT=1024
+fi
+
+SESSION_EXPIRES=$(($(date +%s) + SESSION_TIME))
+
+# ---------------------------------------------------------------------------
+# Libera acesso no IPTABLES
+# ---------------------------------------------------------------------------
+# Chain NAT: CAPTIVE_AUTH_RETURN — clientes autenticados são aceitos sem sofrer REDIRECT
+iptables -t nat -D CAPTIVE_AUTH_RETURN -s "$CLIENT_IP" -j ACCEPT >/dev/null 2>&1 || true
+iptables -t nat -A CAPTIVE_AUTH_RETURN -s "$CLIENT_IP" -j ACCEPT >/dev/null 2>&1 \
+	|| error_exit "Falha ao liberar no NAT"
+
+# Chain FILTER: CAPTIVE_AUTH_FWD — permite forward LAN→WAN
+iptables -D CAPTIVE_AUTH_FWD -s "$CLIENT_IP" -j ACCEPT >/dev/null 2>&1 || true
+iptables -A CAPTIVE_AUTH_FWD -s "$CLIENT_IP" -j ACCEPT >/dev/null 2>&1 \
+	|| error_exit "Falha ao liberar no FORWARD"
+
+# Chain MANGLE: marca pacotes com fwmark do perfil e impede Flow Cache HW bypass
+iptables -t mangle -D CAPTIVE_MANGLE_PRE -s "$CLIENT_IP" -j BLOGSKIP >/dev/null 2>&1 || true
+iptables -t mangle -A CAPTIVE_MANGLE_PRE -s "$CLIENT_IP" -j BLOGSKIP >/dev/null 2>&1 || true
+iptables -t mangle -D CAPTIVE_MANGLE_PRE -d "$CLIENT_IP" -j BLOGSKIP >/dev/null 2>&1 || true
+iptables -t mangle -A CAPTIVE_MANGLE_PRE -d "$CLIENT_IP" -j BLOGSKIP >/dev/null 2>&1 || true
+
+iptables -t mangle -D CAPTIVE_MANGLE_POST -s "$CLIENT_IP" -j MARK --set-mark "$FWMARK" >/dev/null 2>&1 || true
+iptables -t mangle -A CAPTIVE_MANGLE_POST -s "$CLIENT_IP" -j MARK --set-mark "$FWMARK" >/dev/null 2>&1 || true
+iptables -t mangle -D CAPTIVE_MANGLE_POST -d "$CLIENT_IP" -j MARK --set-mark "$FWMARK" >/dev/null 2>&1 || true
+iptables -t mangle -A CAPTIVE_MANGLE_POST -d "$CLIENT_IP" -j MARK --set-mark "$FWMARK" >/dev/null 2>&1 || true
+
+# Limpa o Flow Cache do Broadcom para a nova sessão ser capturada pelo HTB
+/sbin/fc flush >/dev/null 2>&1 || true
+
+logger -t portal_auth "ACESSO LIBERADO: IP=$CLIENT_IP MAC=$CLIENT_MAC user='$USER_NAME' role='$ROLE_NAME' fwmark=$FWMARK dl=${DL_KBIT}kbps"
+
+# ---------------------------------------------------------------------------
+# Registra sessão no arquivo JSON
+# ---------------------------------------------------------------------------
+SESSION_ENTRY=$(printf '{"ip":"%s","mac":"%s","user":"%s","email":"%s","profile":"%s","fwmark":%s,"dl_kbit":%s,"ul_kbit":%s,"expires":%s,"started":%s,"remaining":%s}' \
+	"$CLIENT_IP" "$CLIENT_MAC" "$USER_NAME" "${EMAIL:-$USER_NAME}" "$ROLE_NAME" \
+	"$FWMARK" "${DL_KBIT:-0}" "${UL_KBIT:-0}" "$SESSION_EXPIRES" "$(date +%s)" "$SESSION_TIME")
+
+if [ -f "$SESSIONS_FILE" ] && [ -s "$SESSIONS_FILE" ]; then
+	OTHER_SESSIONS=$(cat "$SESSIONS_FILE" | \
+		sed 's/{"sessions":\[//; s/\]}//' | \
+		sed "s/{\"ip\":\"$CLIENT_IP\"[^}]*},\?//g" | \
+		sed 's/^,//; s/,$//; s/,,/,/g')
+	if [ -n "$OTHER_SESSIONS" ]; then
+		printf '{"sessions":[%s,%s]}' "$SESSION_ENTRY" "$OTHER_SESSIONS" > "$SESSIONS_FILE"
+	else
+		printf '{"sessions":[%s]}' "$SESSION_ENTRY" > "$SESSIONS_FILE"
+	fi
+else
+	printf '{"sessions":[%s]}' "$SESSION_ENTRY" > "$SESSIONS_FILE"
+fi
+
+printf '{"status":"ok","user":"%s","profile":"%s","session_expires":%s,"fwmark":%s}\n' \
+	"$USER_NAME" "$ROLE_NAME" "$SESSION_EXPIRES" "$FWMARK"

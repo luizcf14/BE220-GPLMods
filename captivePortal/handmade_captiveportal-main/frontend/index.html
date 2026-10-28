@@ -1,0 +1,145 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Portal de Acesso — Conexão Povos da Floresta</title>
+    <meta name="description" content="Faça login para acessar a internet via portal captivo.">
+    <!-- Fontes do sistema: sem dependência externa (necessário para CNA de captive portal) -->
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+    <!-- Background animado -->
+    <div class="bg-orbs">
+        <div class="orb orb-1"></div>
+        <div class="orb orb-2"></div>
+        <div class="orb orb-3"></div>
+    </div>
+
+    <!-- Card principal -->
+    <main class="portal-wrapper" role="main">
+        <div class="portal-card" id="loginCard">
+
+            <!-- Logo / Header -->
+            <header class="portal-header">
+                <div class="portal-logo" aria-hidden="true">
+                    <svg viewBox="0 0 48 48" fill="none" xmlns="http://www.w3.org/2000/svg">
+                        <circle cx="24" cy="24" r="22" fill="url(#logoGrad)" opacity="0.15"/>
+                        <path d="M24 8C15.16 8 8 15.16 8 24s7.16 16 16 16 16-7.16 16-16S32.84 8 24 8zm0 4c1.84 0 3.6.36 5.2 1L14.2 28.2A11.88 11.88 0 0120 12.04V12zm0 24c-1.84 0-3.6-.36-5.2-1l15-15.2A11.88 11.88 0 0128 35.96V36zm7.8-4.8A11.88 11.88 0 0128 35.96V12.04A11.88 11.88 0 0133.8 27.2z" fill="url(#logoGrad)"/>
+                        <defs>
+                            <linearGradient id="logoGrad" x1="8" y1="8" x2="40" y2="40" gradientUnits="userSpaceOnUse">
+                                <stop offset="0%" stop-color="#4ade80"/>
+                                <stop offset="100%" stop-color="#22d3ee"/>
+                            </linearGradient>
+                        </defs>
+                    </svg>
+                </div>
+                <h1 class="portal-title">Portal de Acesso</h1>
+                <p class="portal-subtitle">Conexão Povos da Floresta</p>
+            </header>
+
+            <!-- Status / Mensagens -->
+            <div id="statusMessage" class="status-message" role="alert" aria-live="polite" hidden></div>
+
+            <!-- Formulário de Login -->
+            <form id="loginForm" class="login-form" novalidate autocomplete="on">
+
+                <div class="field-group">
+                    <label for="email" class="field-label">E-mail</label>
+                    <div class="field-wrapper">
+                        <svg class="field-icon" viewBox="0 0 20 20" fill="currentColor">
+                            <path d="M2.003 5.884L10 9.882l7.997-3.998A2 2 0 0016 4H4a2 2 0 00-1.997 1.884z"/>
+                            <path d="M18 8.118l-8 4-8-4V14a2 2 0 002 2h12a2 2 0 002-2V8.118z"/>
+                        </svg>
+                        <input
+                            type="email"
+                            id="email"
+                            name="email"
+                            class="field-input"
+                            placeholder="seu@email.com"
+                            autocomplete="username email"
+                            required
+                            aria-required="true"
+                        >
+                    </div>
+                </div>
+
+                <div class="field-group">
+                    <label for="password" class="field-label">Senha</label>
+                    <div class="field-wrapper">
+                        <svg class="field-icon" viewBox="0 0 20 20" fill="currentColor">
+                            <path fill-rule="evenodd" d="M5 9V7a5 5 0 0110 0v2a2 2 0 012 2v5a2 2 0 01-2 2H5a2 2 0 01-2-2v-5a2 2 0 012-2zm8-2v2H7V7a3 3 0 016 0z" clip-rule="evenodd"/>
+                        </svg>
+                        <input
+                            type="password"
+                            id="password"
+                            name="password"
+                            class="field-input"
+                            placeholder="••••••••"
+                            autocomplete="current-password"
+                            required
+                            aria-required="true"
+                            minlength="8"
+                        >
+                        <button type="button" class="toggle-password" id="togglePassword" aria-label="Mostrar senha">
+                            <svg id="eyeIcon" viewBox="0 0 20 20" fill="currentColor">
+                                <path d="M10 12a2 2 0 100-4 2 2 0 000 4z"/>
+                                <path fill-rule="evenodd" d="M.458 10C1.732 5.943 5.522 3 10 3s8.268 2.943 9.542 7c-1.274 4.057-5.064 7-9.542 7S1.732 14.057.458 10zM14 10a4 4 0 11-8 0 4 4 0 018 0z" clip-rule="evenodd"/>
+                            </svg>
+                        </button>
+                    </div>
+                </div>
+
+                <button type="submit" id="submitBtn" class="submit-btn">
+                    <span class="btn-text">Entrar e Conectar</span>
+                    <div class="btn-spinner" hidden aria-hidden="true"></div>
+                </button>
+
+                <!-- Biometria / Digital (para Android / iOS) -->
+                <div id="biometricContainer" class="biometric-container" hidden>
+                    <div class="divider">
+                        <span>ou</span>
+                    </div>
+                    <button type="button" id="biometricBtn" class="biometric-btn">
+                        <svg class="bio-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <path stroke-linecap="round" stroke-linejoin="round" d="M12 11c0 3.517-1.009 6.799-2.753 9.571m-3.44-2.04l.054-.09A13.916 13.916 0 008 11a4 4 0 118 0c0 1.017-.07 2.019-.203 3m-2.118 6.844A21.88 21.88 0 0015.171 17m3.839 1.132c.645-2.266.99-4.659.99-7.132A8 8 0 004 11c0 2.473.345 4.866.99 7.132M12 15c-1.657 0-3-1.343-3-3s1.343-3 3-3 3 1.343 3 3-1.343 3-3 3z"/>
+                        </svg>
+                        <span>Entrar com Biometria</span>
+                    </button>
+                </div>
+
+            </form>
+
+            <!-- Rodapé -->
+            <footer class="portal-footer">
+                <p>Rede protegida · Acesso monitorado</p>
+                <p class="portal-version">Portal Captivo 3000</p>
+            </footer>
+
+        </div>
+
+        <!-- Card de Sucesso (hidden initially) -->
+        <div class="portal-card success-card" id="successCard" hidden>
+            <div class="success-icon" aria-hidden="true">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <path stroke-linecap="round" stroke-linejoin="round" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"/>
+                </svg>
+            </div>
+            <h2 class="success-title">Acesso Liberado!</h2>
+            <p class="success-subtitle" id="successSubtitle">Bem-vindo!</p>
+            <div class="countdown-wrapper">
+                <p class="countdown-text">Redirecionando em <strong id="countdown">5</strong>s...</p>
+                <div class="countdown-bar">
+                    <div class="countdown-progress" id="countdownBar"></div>
+                </div>
+            </div>
+            <a href="https://conexaopovosdafloresta.org.br/" id="continueBtn" class="submit-btn" style="text-decoration:none; text-align:center; display:block;">
+                Continuar Agora →
+            </a>
+        </div>
+    </main>
+
+    <script src="app.js"></script>
+</body>
+</html>

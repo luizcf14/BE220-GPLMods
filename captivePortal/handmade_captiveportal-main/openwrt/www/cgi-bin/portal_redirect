@@ -1,0 +1,71 @@
+#!/bin/sh
+# Portal Captivo 3000 — CGI de Redirecionamento
+# /www/cgi-bin/portal_redirect
+#
+# Invocado de duas formas:
+#   1. Diretamente: nftables redireciona TCP:80 → porta 2080 → uhttpd
+#   2. Como error_page: uhttpd chama este script para qualquer 404
+#      (ex: http://msftconnecttest.com/connecttest.txt → 2080 → 404 → aqui)
+#
+# Retorna um 302 para a tela de login.
+# Isso dispara o pop-up automático no Windows (NCSI), iOS e Android.
+#
+# SEGURANÇA: Não passa MAC/IP na URL — portal_auth resolve via REMOTE_ADDR.
+
+PORTAL_HOST="roteador.conexaopovosdafloresta.org.br"
+
+# Lê configuração UCI se disponível
+if [ -f /sbin/uci ]; then
+	_dom=$(uci -q get captiveportal.global.router_domain)
+	[ -n "$_dom" ] && PORTAL_HOST="$_dom"
+fi
+
+# URL canônica do portal
+PORTAL_URL="http://${PORTAL_HOST}/portal/"
+
+# Tenta preservar a URL original para o parâmetro 'next' pós-login
+# (HTTP_HOST pode estar vazio quando chamado como error_page)
+ORIGINAL_HOST="${HTTP_HOST:-}"
+ORIGINAL_URI="${REQUEST_URI:-/}"
+
+CLIENT_IP="$REMOTE_ADDR"
+IS_AUTHENTICATED=false
+if [ -n "$CLIENT_IP" ] && command -v nft >/dev/null 2>&1; then
+	if nft list set inet fw4 captive_authenticated 2>/dev/null | grep -q "$CLIENT_IP"; then
+		IS_AUTHENTICATED=true
+	fi
+fi
+
+# Verifica se o host requisitado está explicitamente na Blacklist DNS
+IS_BLACKLISTED=false
+if [ -n "$ORIGINAL_HOST" ] && [ -f /tmp/dnsmasq.d/captive-blacklist.conf ]; then
+	if grep -q "address=/${ORIGINAL_HOST}/" /tmp/dnsmasq.d/captive-blacklist.conf 2>/dev/null; then
+		IS_BLACKLISTED=true
+	fi
+fi
+
+if [ "$IS_BLACKLISTED" = "true" ]; then
+	# Requisição para site explicitamente bloqueado pela Blacklist
+	REDIRECT_URL="http://${PORTAL_HOST}/portal/blocked.html"
+elif [ "$IS_AUTHENTICATED" = "true" ]; then
+	# Cliente autenticado acessando recurso do roteador
+	REDIRECT_URL="${PORTAL_URL}"
+elif [ -n "$ORIGINAL_HOST" ] && [ "$ORIGINAL_HOST" != "$PORTAL_HOST" ] && [ "$ORIGINAL_HOST" != "192.168.1.1" ]; then
+	# Cliente não autenticado tentando navegar -> redireciona para login com 'next'
+	ORIGINAL_URL="http://${ORIGINAL_HOST}${ORIGINAL_URI}"
+	ENCODED_NEXT=$(printf '%s' "$ORIGINAL_URL" | \
+		sed 's/%/%25/g; s/ /%20/g; s/:/%3A/g; s|/|%2F|g; s/?/%3F/g; s/=/%3D/g; s/&/%26/g')
+	REDIRECT_URL="${PORTAL_URL}?next=${ENCODED_NEXT}"
+else
+	REDIRECT_URL="${PORTAL_URL}"
+fi
+
+printf 'Status: 302 Found\r\n'
+printf 'Location: %s\r\n' "$REDIRECT_URL"
+printf 'Cache-Control: no-store, no-cache\r\n'
+printf 'Content-Type: text/html\r\n'
+printf 'Connection: close\r\n'
+printf '\r\n'
+printf '<html><head><meta http-equiv="refresh" content="0;url=%s"></head>' "$REDIRECT_URL"
+printf '<body>Redirecionando para o portal de login... <a href="%s">Clique aqui</a></body></html>\n' \
+	"$REDIRECT_URL"

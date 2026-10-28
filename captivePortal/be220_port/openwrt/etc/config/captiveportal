@@ -1,0 +1,77 @@
+# Portal Captivo 3000 — Configuração UCI (BE220)
+# /etc/config/captiveportal
+#
+# Editável via SSH: uci set captiveportal.global.session_time=7200 && uci commit captiveportal
+# Depois: /etc/init.d/captiveportal restart
+
+config captiveportal 'global'
+	# Habilitar QoS / controle de banda (tc/HTB)
+	option enable_qos     '1'
+	# Velocidade real da WAN
+	option wan_speed      '800mbit'
+	# URL base do backend REST (validação de token)
+	option api_url        'https://apidev.conexaopovosdafloresta.org.br'
+	# Endpoint de validação de token Bearer
+	option api_user_path  '/api/user/me'
+	# Duração de sessão em segundos (3600 = 1h)
+	option session_time   '3600'
+	# Interface WAN (auto-detectada se ausente)
+	option wan_interface  'eth0'
+	# Interface LAN bridge
+	option lan_interface  'br-lan'
+	# IP do roteador (sempre liberado no walled garden)
+	option router_ip      '192.168.12.1'
+	# Domínio local do roteador (apontado no dnsmasq)
+	option router_domain  'roteador.conexaopovosdafloresta.org.br'
+	# Porta interna do portal (redirecionador captive)
+	option portal_port    '2080'
+
+# -------------------------------------------------------------------------
+# Walled Garden — Domínios e IPs liberados ANTES do login
+# -------------------------------------------------------------------------
+config captiveportal 'walled_garden'
+	list domain '192.168.12.1'
+	list domain '192.168.0.1'
+	list domain 'tplinkwifi.net'
+	list domain 'tplinklogin.net'
+	list domain 'apidev.conexaopovosdafloresta.org.br'
+	list domain 'conexaopovosdafloresta.org.br'
+	list domain 'paineldecontrole-dev.conexaopovosdafloresta.org.br'
+	list domain 'roteador.conexaopovosdafloresta.org.br'
+	list domain '*.conexaopovosdafloresta.org.br'
+
+# -------------------------------------------------------------------------
+# Blacklist DNS
+# -------------------------------------------------------------------------
+config captiveportal 'blacklist'
+	option enabled        '1'
+	option community_url  'https://raw.githubusercontent.com/StevenBlack/hosts/master/alternates/porn/hosts'
+	list domain 'siteindesejado.com'
+
+# -------------------------------------------------------------------------
+# Perfis de Velocidade
+# fwmark deve ser único e não-zero
+# -------------------------------------------------------------------------
+config profile 'visitante'
+	option name     'Visitante'
+	option fwmark   '1'
+	option dl_kbit  '2048'
+	option ul_kbit  '1024'
+
+config profile 'basico'
+	option name     'Básico'
+	option fwmark   '2'
+	option dl_kbit  '5120'
+	option ul_kbit  '2048'
+
+config profile 'premium'
+	option name     'Premium'
+	option fwmark   '3'
+	option dl_kbit  '20480'
+	option ul_kbit  '10240'
+
+config profile 'ilimitado'
+	option name     'Ilimitado'
+	option fwmark   '4'
+	option dl_kbit  '0'
+	option ul_kbit  '0'

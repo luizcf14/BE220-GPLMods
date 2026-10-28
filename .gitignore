@@ -1,0 +1,9 @@
+*.bin
+squashfs-root/
+scratch/
+cookie.txt
+scratch_logs.json
+cloudController/data/
+*.key
+setup_code.txt
+users.json
